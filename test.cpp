@@ -9,8 +9,6 @@
 #include <fstream>
 #include <sstream>
 
-
-
 #pragma comment(lib, "d3d9.lib")
 #pragma comment(lib, "d3dx9.lib")
 
@@ -51,7 +49,7 @@ struct Vec3 {
     float x, y, z;
 };
 
-struct Gift { float x, y, z; };
+struct Gift { float x, y, z, yaw; };
 std::vector<Gift> g_gifts;
 
 bool g_recording = false;
@@ -107,6 +105,7 @@ static IDirect3DVertexBuffer9* savedVB = nullptr;
 static IDirect3DIndexBuffer9* savedIB = nullptr;
 static UINT savedStride = 0;
 
+float px, py, pz, pyaw;
 
 void CheckToggleKey()
 {
@@ -176,14 +175,15 @@ void DrawCross(IDirect3DDevice9* dev, float x, float y, float size, D3DCOLOR col
     DrawLine(dev, x, y - size, x, y + size, color);
 }
 
-void DrawCube(LPDIRECT3DDEVICE9 dev, const D3DXVECTOR3& pos, float size)
+void DrawCube(LPDIRECT3DDEVICE9 dev, const D3DXVECTOR3& pos, float size, float yaw)
 {
 
     // Build world matrix (translation + scale)
-    D3DXMATRIX mScale, mTrans, mWorld;
+    D3DXMATRIX mScale, mTrans, mWorld, mRot;
     D3DXMatrixScaling(&mScale, size, size, size);
     D3DXMatrixTranslation(&mTrans, pos.x, pos.y, pos.z);
-    mWorld = mScale * mTrans;
+    D3DXMatrixRotationZ(&mRot, -yaw); // or RotationY depending on your up-axis
+    mWorld = mScale * mRot * mTrans;
 
     dev->SetTransform(D3DTS_WORLD, &mWorld);
     dev->SetTransform(D3DTS_VIEW, &g_view);
@@ -214,29 +214,8 @@ int fps = 900;
 void DrawSanta(LPDIRECT3DDEVICE9 dev, const D3DXVECTOR3& pos, float size)
 {
     D3DXVECTOR3 dir = pos - lastPos;
-    float yaw = atan2f(-dir.x, dir.y);  // swap X/Y if your axes differ
+    float yaw = -pyaw; //atan2f(-dir.x, dir.y);  // swap X/Y if your axes differ
     if (yaw != 0.f) lastYaw = yaw;
-
-    // backup shaders
-    IDirect3DVertexShader9* oldVS = nullptr;
-    IDirect3DPixelShader9* oldPS = nullptr;
-    dev->GetVertexShader(&oldVS);
-    dev->GetPixelShader(&oldPS);
-
-    // backup render states
-    DWORD oldLighting, oldFog, oldAlpha, oldSpecular;
-    dev->GetRenderState(D3DRS_LIGHTING, &oldLighting);
-    dev->GetRenderState(D3DRS_FOGENABLE, &oldFog);
-    dev->GetRenderState(D3DRS_ALPHABLENDENABLE, &oldAlpha);
-    dev->GetRenderState(D3DRS_SPECULARENABLE, &oldSpecular);
-
-    // backup textures & stage states
-    DWORD oldColorOp[8]{}, oldAlphaOp[8]{};
-    for (int i = 0; i < 8; ++i)
-    {
-        dev->GetTextureStageState(i, D3DTSS_COLOROP, &oldColorOp[i]);
-        dev->GetTextureStageState(i, D3DTSS_ALPHAOP, &oldAlphaOp[i]);
-    }
 
 
     dev->SetVertexShader(nullptr);
@@ -272,26 +251,6 @@ void DrawSanta(LPDIRECT3DDEVICE9 dev, const D3DXVECTOR3& pos, float size)
     dev->SetIndices(savedIB);
 
     oDrawIndexedPrimitive(dev, D3DPT_TRIANGLELIST, 0, 0, 8426, 0, 14796);
-
-
-    // restore shaders
-    dev->SetVertexShader(oldVS);
-    dev->SetPixelShader(oldPS);
-    if (oldVS) oldVS->Release();
-    if (oldPS) oldPS->Release();
-
-    // restore render states
-    dev->SetRenderState(D3DRS_LIGHTING, oldLighting);
-    dev->SetRenderState(D3DRS_FOGENABLE, oldFog);
-    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, oldAlpha);
-    dev->SetRenderState(D3DRS_SPECULARENABLE, oldSpecular);
-
-    // restore textures
-    for (int i = 0; i < 8; ++i)
-    {
-        dev->SetTextureStageState(i, D3DTSS_COLOROP, oldColorOp[i]);
-        dev->SetTextureStageState(i, D3DTSS_ALPHAOP, oldAlphaOp[i]);
-    }
 
     lastPos = pos;
 }
@@ -368,6 +327,11 @@ HRESULT __stdcall hkDrawIndexedPrimitive(
 {
     HRESULT result = oDrawIndexedPrimitive(dev, Type, BaseVertexIndex, MinVertexIndex, NumVertices, StartIndex, PrimCount);
 
+    // --- setup simple 2D draw state ---
+    IDirect3DStateBlock9* stateBlock = nullptr;
+    dev->CreateStateBlock(D3DSBT_ALL, &stateBlock);
+    if (stateBlock) stateBlock->Capture();
+
     // Detect gift mesh
     if (NumVertices == 200 && PrimCount == 148)
     {
@@ -376,12 +340,39 @@ HRESULT __stdcall hkDrawIndexedPrimitive(
         dev->GetVertexShaderConstantF(0, vsConsts, 4);
         float* m = &vsConsts[0];
         float wx = m[3], wy = m[7], wz = m[11];
+        float yaw = atan2(m[2], m[0]);
 
-        g_gifts.push_back({ wx, wy, wz });
+        g_gifts.push_back({ wx, wy, wz, yaw });
     }
 
 
     if (NumVertices == 8426 && PrimCount == 14796) {
+        D3DXVECTOR3 playerWorld = { px, py, pz };
+        D3DXVECTOR3 playerScreen;
+        ProjectWorldToScreen(dev, playerWorld, playerScreen);
+
+        if (drawESP) {
+            dev->SetVertexShader(nullptr);
+            dev->SetPixelShader(nullptr);
+            dev->SetTexture(0, nullptr);
+
+            for (auto& g : g_gifts)
+            {
+                D3DXVECTOR3 world(g.x, g.z, g.y);
+                D3DXVECTOR3 screen;
+
+                if (ProjectWorldToScreen(dev, world, screen))
+                {
+                    // bright cross marker
+                    DrawCross(dev, screen.x, screen.y, 6.0f, D3DCOLOR_ARGB(255, 0, 255, 0));
+                    // optional debug line from screen center (Santa/cam) to gift
+                    DrawLine(dev, playerScreen.x, playerScreen.y, screen.x, screen.y, D3DCOLOR_ARGB(180, 255, 255, 255));
+                    DrawCube(dev, world, 1.0f, g.yaw);
+
+                }
+            }
+        }
+
         if (!savedVB && !savedIB)
         {
             IDirect3DVertexBuffer9* vb = nullptr;
@@ -405,40 +396,60 @@ HRESULT __stdcall hkDrawIndexedPrimitive(
             }
         }
     }
+    if (stateBlock)
+    {
+        stateBlock->Apply();
+        stateBlock->Release();
+    }
 
     return result;
 }
 
-// =====================================================
-// Hook: EndScene
-// =====================================================
-HRESULT __stdcall hkEndScene(IDirect3DDevice9* dev)
+void updatePlayerCoords()
 {
-    if (!g_santaBase || !g_camPtr)
-        return oEndScene(dev);
+    px = (float)*(double*)(g_santaBase + OFF_SANTA_X);
+    py = (float)*(double*)(g_santaBase + OFF_SANTA_Y);
+    pz = (float)*(double*)(g_santaBase + OFF_SANTA_Z);
+}
 
-    IDirect3DSurface9* backBuf = nullptr;
-    if (SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuf)))
-        dev->SetRenderTarget(0, backBuf);
 
-    // --- setup simple 2D draw state ---
-    IDirect3DStateBlock9* stateBlock = nullptr;
-    dev->CreateStateBlock(D3DSBT_ALL, &stateBlock);
-    if (stateBlock) stateBlock->Capture();
-
+void updateViewMatrix(IDirect3DDevice9* dev)
+{
     // --- viewport center (for reference lines) ---
     D3DVIEWPORT9 vp;
     dev->GetViewport(&vp);
     float cx = vp.Width * 0.5f;
     float cy = vp.Height * 0.5f;
 
-    CheckToggleKey();
+    float atX = *(float*)(g_camPtr + OFF_CAMT_X);
+    float atY = *(float*)(g_camPtr + OFF_CAMT_Y);
+    float atZ = *(float*)(g_camPtr + OFF_CAMT_Z);
 
+    // --- read camera position ---
+    float camX = *(float*)(g_camPtr + OFF_CAM_X);
+    float camY = *(float*)(g_camPtr + OFF_CAM_Y);
+    float camZ = *(float*)(g_camPtr + OFF_CAM_Z);
 
-    float px = (float)*(double*)(g_santaBase + OFF_SANTA_X); 
-    float py = (float)*(double*)(g_santaBase + OFF_SANTA_Y);
-    float pz = (float)*(double*)(g_santaBase + OFF_SANTA_Z);
+    D3DXVECTOR3 eye(camX, camY, camZ);
+    D3DXVECTOR3 up(0, 0, 1);
+    D3DXVECTOR3 at(atX, atY, atZ);
+    D3DXMatrixLookAtRH(&g_view, &eye, &at, &up); // Right-handed (OpenGL-like)
 
+    D3DXVECTOR3 dir = at - eye;
+    float yawRad = atan2f(dir.x, dir.y);  // (X over Y, since Y is "forward")
+    pyaw = yawRad;
+
+    // Parameters
+    float fovY = D3DXToRadian(50.0f); // FOV in radians
+    float aspect = (float)vp.Width / (float)vp.Height;
+    float zn = 0.05f;   // near plane
+    float zf = 120.0; // far plane
+
+    D3DXMatrixPerspectiveFovRH(&g_proj, fovY, aspect, zn, zf);
+}
+
+void doRecording()
+{
     if (g_recording && g_logFile.is_open())
     {
         g_logFile << "pos=" << px << " " << py << " " << pz << "\n";
@@ -461,149 +472,31 @@ HRESULT __stdcall hkEndScene(IDirect3DDevice9* dev)
     else {
         testWorld = { 0.f, 0.f, 0.91f };
     }
+}
+
+// =====================================================
+// Hook: EndScene
+// =====================================================
+HRESULT __stdcall hkEndScene(IDirect3DDevice9* dev)
+{
+    if (!g_santaBase || !g_camPtr)
+        return oEndScene(dev);
+
+    IDirect3DSurface9* backBuf = nullptr;
+    if (SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuf)))
+        dev->SetRenderTarget(0, backBuf);
+
+    CheckToggleKey();
+    doRecording();
 
 
-    float atX = *(float*)(g_camPtr + OFF_CAMT_X);
-    float atY = *(float*)(g_camPtr + OFF_CAMT_Y);
-    float atZ = *(float*)(g_camPtr + OFF_CAMT_Z);
+    updatePlayerCoords();
+    updateViewMatrix(dev);
 
-    // --- read camera position ---
-    float camX = *(float*)(g_camPtr + OFF_CAM_X);
-    float camY = *(float*)(g_camPtr + OFF_CAM_Y);
-    float camZ = *(float*)(g_camPtr + OFF_CAM_Z);
-
-    D3DXVECTOR3 eye(camX, camY, camZ);
-    D3DXVECTOR3 up(0, 0, 1);
-    D3DXVECTOR3 at(atX,atY,atZ);
-    D3DXMatrixLookAtRH(&g_view, &eye, &at, &up); // Right-handed (OpenGL-like)
-
-    // Parameters
-    float fovY = D3DXToRadian(50.0f); // FOV in radians
-    float aspect = (float)vp.Width / (float)vp.Height;
-    float zn = 0.05f;   // near plane
-    float zf = 120.0; // far plane
-
-    D3DXMatrixPerspectiveFovRH(&g_proj, fovY, aspect, zn, zf);
-    
-    D3DXVECTOR3 playerWorld = { px, py, pz - 0.91f };
-    D3DXVECTOR3 playerScreen;
-    ProjectWorldToScreen(dev, playerWorld, playerScreen);
-
-    if (drawESP) {
-        IDirect3DVertexShader9* oldVS = nullptr;
-        IDirect3DPixelShader9* oldPS = nullptr;
-        dev->GetVertexShader(&oldVS);
-        dev->GetPixelShader(&oldPS);
-
-        dev->SetVertexShader(nullptr);
-        dev->SetPixelShader(nullptr);
-        dev->SetTexture(0, nullptr);
-
-        for (auto& g : g_gifts)
-        {
-            D3DXVECTOR3 world(g.x, g.z, g.y);
-            D3DXVECTOR3 screen;
-
-            if (ProjectWorldToScreen(dev, world, screen))
-            {
-                // bright cross marker
-                DrawCross(dev, screen.x, screen.y, 6.0f, D3DCOLOR_ARGB(255, 0, 255, 0));
-                // optional debug line from screen center (Santa/cam) to gift
-                DrawLine(dev, playerScreen.x, playerScreen.y, screen.x, screen.y, D3DCOLOR_ARGB(180, 255, 255, 255));
-                DrawCube(dev, world, 1.0f);
-
-            }
-        }
-
-        dev->SetVertexShader(oldVS);
-        dev->SetPixelShader(oldPS);
-
-        if (oldVS) oldVS->Release();
-        if (oldPS) oldPS->Release();
-    }
 
     g_gifts.clear();
 
-    if (stateBlock)
-    {
-        stateBlock->Apply();
-        stateBlock->Release();
-    }
-
     return oEndScene(dev);
-}
-
-typedef void(__cdecl* SteamAPI_RunCallbacks_t)();
-typedef void* (__cdecl* SteamUser_t)();
-typedef const char* (__cdecl* SteamFriends_GetPersonaName_t)(void*);
-typedef void* (__cdecl* SteamFriends_t)();
-// typedefs for the functions we’ll resolve dynamically
-typedef void* (__cdecl* SteamInternal_FindOrCreateUserInterface_t)(int hSteamUser, const char* pszVersion);
-typedef const char* (__cdecl* SteamAPI_ISteamFriends_GetPersonaName_t)(void*);
-
-void CallSteamRunCallbacks()
-{
-    HMODULE steamMod = GetModuleHandleA("steam_api.dll");
-
-    if (!steamMod)
-        return; // not loaded
-
-    static SteamAPI_RunCallbacks_t fnRunCallbacks = nullptr;
-
-    if (!fnRunCallbacks)
-        fnRunCallbacks = reinterpret_cast<SteamAPI_RunCallbacks_t>(
-            GetProcAddress(steamMod, "SteamAPI_RunCallbacks")
-            );
-
-    if (fnRunCallbacks) {
-        fnRunCallbacks();
-    }
-}
-
-void PrintSteamName()
-{
-    HMODULE steamMod = GetModuleHandleA("steam_api.dll");
-    if (!steamMod)
-        steamMod = GetModuleHandleA("steam_api64.dll");
-
-    if (!steamMod) {
-        printf("steam_api not loaded in process.\n");
-        return;
-    }
-
-    auto pFindInterface = (SteamInternal_FindOrCreateUserInterface_t)
-        GetProcAddress(steamMod, "SteamInternal_CreateInterface");
-    auto pGetName = (SteamAPI_ISteamFriends_GetPersonaName_t)
-        GetProcAddress(steamMod, "SteamAPI_ISteamFriends_GetPersonaName");
-
-    if (!pFindInterface || !pGetName) {
-        printf("Cannot locate internal Steam exports.\n");
-        return;
-    }
-
-    void* friendsInterface = nullptr;
-    char versionStr[64];
-
-    // Try several possible version numbers (SteamFriends010–020)
-    for (int i = 10; i <= 30; i++) {
-        sprintf_s(versionStr, "SteamFriends%03d", i);
-        friendsInterface = pFindInterface(0, versionStr);
-        if (friendsInterface) {
-            printf("Found ISteamFriends version: %s\n", versionStr);
-            break;
-        }
-    }
-
-    if (!friendsInterface) {
-        printf("Failed to get ISteamFriends interface pointer (no version matched).\n");
-        return;
-    }
-
-    const char* name = pGetName(friendsInterface);
-    if (name)
-        printf("Steam user: %s\n", name);
-    else
-        printf("Unable to fetch Steam username.\n");
 }
 
 
