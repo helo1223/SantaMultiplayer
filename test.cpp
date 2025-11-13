@@ -1,5 +1,9 @@
 ﻿#define _CRT_SECURE_NO_WARNINGS
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
+
 #include <d3d9.h>
 #include <d3dx9.h>
 #include <iostream>
@@ -8,6 +12,9 @@
 #include "MinHook.h"
 #include <fstream>
 #include <sstream>
+
+#include <enet/enet.h>
+#include <unordered_map>
 
 #pragma comment(lib, "d3d9.lib")
 #pragma comment(lib, "d3dx9.lib")
@@ -24,6 +31,10 @@ typedef HRESULT(__stdcall* SetVertexShaderConstantF_t)(
 DrawIndexedPrimitive_t oDrawIndexedPrimitive = nullptr;
 EndScene_t oEndScene = nullptr;
 SetVertexShaderConstantF_t oSetVertexShaderConstantF = nullptr;
+
+static HWND gameWindow = nullptr;
+static WNDPROC oWndProc = nullptr;
+
 
 static uintptr_t g_gameBase = 0;
 static uintptr_t g_santaBase = 0;
@@ -49,6 +60,11 @@ struct Vec3 {
     float x, y, z;
 };
 
+struct RecordedPosition {
+    Vec3 pos;
+    float yaw;
+};
+
 struct Gift { float x, y, z, yaw; };
 std::vector<Gift> g_gifts;
 
@@ -56,7 +72,7 @@ bool g_recording = false;
 std::ofstream g_logFile;
 
 bool g_replaying = false;
-std::vector<Vec3> g_recordedPositions;
+std::vector<RecordedPosition> g_recordedPositions;
 size_t g_replayIndex = 0;
 
 
@@ -107,8 +123,133 @@ static UINT savedStride = 0;
 
 float px, py, pz, pyaw;
 
+static ENetHost* g_client = nullptr;
+static ENetPeer* g_serverPeer = nullptr;
+static bool g_isConnected = false;
+
+struct RemotePlayer {
+    float x, y, z, yaw;
+};
+
+std::unordered_map<unsigned, RemotePlayer> g_otherPlayers;
+
+LRESULT CALLBACK HookedWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    if (msg == WM_ACTIVATEAPP || msg == WM_ACTIVATE)
+        return 0; // ignore deactivate
+
+    if (msg == WM_KILLFOCUS)
+        return 0; // ignore focus loss
+
+    return CallWindowProc(oWndProc, hwnd, msg, wParam, lParam);
+}
+
+void HookWindow(HWND hwnd)
+{
+    oWndProc = (WNDPROC)SetWindowLongPtr(hwnd, GWL_WNDPROC, (LONG_PTR)HookedWndProc);
+}
+
+bool ENet_Connect(const char* ip, int port)
+{
+    if (enet_initialize() != 0) {
+        std::cout << "[ENet] Failed to initialize\n";
+        return false;
+    }
+
+    g_client = enet_host_create(NULL, 1, 2, 0, 0);
+    if (!g_client) {
+        std::cout << "[ENet] Failed to create ENet client host\n";
+        return false;
+    }
+
+    ENetAddress address;
+    enet_address_set_host(&address, ip);
+    address.port = port;
+
+    g_serverPeer = enet_host_connect(g_client, &address, 2, 0);
+    if (!g_serverPeer) {
+        std::cout << "[ENet] No available peers for connection\n";
+        return false;
+    }
+
+    ENetEvent event;
+    if (enet_host_service(g_client, &event, 5000) > 0 &&
+        event.type == ENET_EVENT_TYPE_CONNECT)
+    {
+        std::cout << "[ENet] Connected to " << ip << ":" << port << "\n";
+        g_isConnected = true;
+        return true;
+    }
+
+    std::cout << "[ENet] Failed to connect\n";
+    enet_peer_reset(g_serverPeer);
+    return false;
+}
+
+void ENet_Send(const std::string& msg)
+{
+    if (!g_isConnected) return;
+
+    ENetPacket* packet = enet_packet_create(
+        msg.c_str(), msg.size() + 1,
+        ENET_PACKET_FLAG_RELIABLE
+    );
+
+    enet_peer_send(g_serverPeer, 0, packet);
+}
+
+void ENet_Poll()
+{
+    if (!g_client) return;
+
+    ENetEvent event;
+    while (enet_host_service(g_client, &event, 0) > 0)
+    {
+        switch (event.type)
+        {
+        case ENET_EVENT_TYPE_RECEIVE:
+        {
+            std::string msg((char*)event.packet->data);
+
+            // Example: SYNC 1234 1.0 2.0 3.0 1.57
+            if (msg.rfind("SYNC", 0) == 0)
+            {
+                unsigned id;
+                float x, y, z, yaw;
+
+                sscanf(msg.c_str(), "SYNC %u %f %f %f %f", &id, &x, &y, &z, &yaw);
+
+                // ignore our own data
+                if (id != GetCurrentProcessId()) {
+                    g_otherPlayers[id] = { x, y, z, yaw };
+                }
+            }
+
+            enet_packet_destroy(event.packet);
+            break;
+        }
+
+        case ENET_EVENT_TYPE_DISCONNECT:
+            std::cout << "[ENet] Disconnected\n";
+            g_isConnected = false;
+            break;
+        }
+    }
+}
+
+
+
+
 void CheckToggleKey()
 {
+
+    if (GetAsyncKeyState(VK_F2) & 1)
+    {
+        if (g_isConnected) {
+            ENet_Send("Hello from the injected DLL!");
+        }
+    }
+
     if (GetAsyncKeyState(VK_F9) & 1) // pressed once
     {
         g_recording = !g_recording;
@@ -143,9 +284,14 @@ void CheckToggleKey()
             {
                 if (line.rfind("pos=", 0) == 0)
                 {
+                    RecordedPosition rec;
                     Vec3 v{};
-                    if (sscanf_s(line.c_str(), "pos=%f %f %f", &v.x, &v.y, &v.z) == 3)
-                        g_recordedPositions.push_back(v);
+                    float yaw;
+                    if (sscanf_s(line.c_str(), "pos=%f %f %f %f", &v.x, &v.y, &v.z, &yaw) == 4) {
+                        rec.pos = v;
+                        rec.yaw = yaw;
+                        g_recordedPositions.push_back(rec);
+                    }
                 }
             }
 
@@ -204,6 +350,7 @@ void DrawCube(LPDIRECT3DDEVICE9 dev, const D3DXVECTOR3& pos, float size, float y
     );
 }
 D3DXVECTOR3 testWorld = { 0.0f, 0.0f, 0.0f };
+float testYaw = 0.0f;
 
 
 D3DXVECTOR3 lastPos = { 0.f, 0.f, 0.f };
@@ -211,10 +358,9 @@ float lastYaw = 0.0f;
 
 int fps = 900;
 
-void DrawSanta(LPDIRECT3DDEVICE9 dev, const D3DXVECTOR3& pos, float size)
+void DrawSanta(LPDIRECT3DDEVICE9 dev, const D3DXVECTOR3& pos, float size, float yaw)
 {
     D3DXVECTOR3 dir = pos - lastPos;
-    float yaw = -pyaw; //atan2f(-dir.x, dir.y);  // swap X/Y if your axes differ
     if (yaw != 0.f) lastYaw = yaw;
 
 
@@ -392,7 +538,16 @@ HRESULT __stdcall hkDrawIndexedPrimitive(
         else {
             if (savedVB && savedIB)
             {
-                DrawSanta(dev, testWorld, 1.5f);
+                DrawSanta(dev, testWorld, 1.5f, 0.0f);
+
+                for (auto& kv : g_otherPlayers)
+                {
+                    const RemotePlayer& rp = kv.second;
+
+                    D3DXVECTOR3 santaWorld(rp.x, rp.y, rp.z);
+
+                    DrawSanta(dev, santaWorld, 1.5f, -rp.yaw);
+                }
             }
         }
     }
@@ -452,14 +607,16 @@ void doRecording()
 {
     if (g_recording && g_logFile.is_open())
     {
-        g_logFile << "pos=" << px << " " << py << " " << pz << "\n";
+        g_logFile << "pos=" << px << " " << py << " " << pz <<  " " << pyaw << "\n";
     }
 
     if (g_replaying && !g_recordedPositions.empty())
     {
-        testWorld.x = g_recordedPositions[g_replayIndex].x;
-        testWorld.y = g_recordedPositions[g_replayIndex].y;
-        testWorld.z = g_recordedPositions[g_replayIndex].z;
+        Vec3 pos = g_recordedPositions[g_replayIndex].pos;
+        testWorld.x = pos.x;
+        testWorld.y = pos.y;
+        testWorld.z = pos.z;
+        testYaw = g_recordedPositions[g_replayIndex].yaw;
 
         g_replayIndex++;
         if (g_replayIndex >= g_recordedPositions.size())
@@ -474,13 +631,47 @@ void doRecording()
     }
 }
 
+typedef BOOL(WINAPI* ClipCursor_t)(const RECT*);
+ClipCursor_t oClipCursor;
+
+BOOL WINAPI hkClipCursor(const RECT* rect)
+{
+    // block mouse confinement
+    return TRUE;
+}
+
+typedef BOOL(WINAPI* SetCursorPos_t)(int, int);
+SetCursorPos_t oSetCursorPos;
+
+BOOL WINAPI hkSetCursorPos(int X, int Y)
+{
+    // block recentering
+    return TRUE;
+}
+
+bool windowHooked = false;
+
 // =====================================================
 // Hook: EndScene
 // =====================================================
 HRESULT __stdcall hkEndScene(IDirect3DDevice9* dev)
 {
+    ENet_Poll();
+
     if (!g_santaBase || !g_camPtr)
         return oEndScene(dev);
+
+    if (!gameWindow)
+    {
+        D3DDEVICE_CREATION_PARAMETERS p;
+        dev->GetCreationParameters(&p);
+        gameWindow = p.hFocusWindow;
+    }
+    else if (!windowHooked){
+        HookWindow(gameWindow);
+        std::cout << "Window hooked - pausing disabled.\n";
+        windowHooked = true;
+    }
 
     IDirect3DSurface9* backBuf = nullptr;
     if (SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuf)))
@@ -493,6 +684,11 @@ HRESULT __stdcall hkEndScene(IDirect3DDevice9* dev)
     updatePlayerCoords();
     updateViewMatrix(dev);
 
+    if (g_isConnected) {
+        char buf[128];
+        sprintf(buf, "POS %.3f %.3f %.3f %.3f %u", px, py, pz, pyaw, GetCurrentProcessId());
+        ENet_Send(buf);
+    }
 
     g_gifts.clear();
 
@@ -529,14 +725,18 @@ void** GetDeviceVTable()
 
 bool lastFramePressed = false;
 
+
 DWORD WINAPI MainThread(LPVOID)
 {
     AllocConsole();
     freopen("CONOUT$", "w", stdout);
     std::cout << "[Overlay] DLL loaded\n";
 
+    ENet_Connect("127.0.0.1", 12345);
+
     if (MH_Initialize() != MH_OK)
         return 0;
+
 
     int tries = 0;
     void** vtbl = nullptr;
@@ -550,6 +750,12 @@ DWORD WINAPI MainThread(LPVOID)
         MH_EnableHook(vtbl[82]);
     if (MH_CreateHook(vtbl[42], &hkEndScene, (void**)&oEndScene) == MH_OK)
         MH_EnableHook(vtbl[42]);
+
+    MH_CreateHook(&ClipCursor, hkClipCursor, (void**)&oClipCursor);
+    MH_EnableHook(&ClipCursor);
+    MH_CreateHook(&SetCursorPos, hkSetCursorPos, (void**)&oSetCursorPos);
+    MH_EnableHook(&SetCursorPos);
+    ShowCursor(true);
     std::cout << "[Overlay] Hooks active\n";
     
     while (!g_gameBase) {
