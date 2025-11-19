@@ -12,9 +12,10 @@
 #include "MinHook.h"
 #include <fstream>
 #include <sstream>
-
 #include <enet/enet.h>
 #include <unordered_map>
+#include <steam/steam_api.h>
+
 
 #pragma comment(lib, "d3d9.lib")
 #pragma comment(lib, "d3dx9.lib")
@@ -129,9 +130,30 @@ static bool g_isConnected = false;
 
 struct RemotePlayer {
     float x, y, z, yaw;
+    std::string name;
 };
 
 std::unordered_map<unsigned, RemotePlayer> g_otherPlayers;
+
+HMODULE hSteam = nullptr;
+
+bool gotSteamName = false;
+std::string g_steamName;
+
+ID3DXFont* g_pFont = nullptr;
+
+
+void TryGrabSteamName()
+{
+    if (gotSteamName) return;
+
+    const char* name = SteamFriends()->GetPersonaName();
+    if (name && *name) {
+        g_steamName = name;
+        gotSteamName = true;
+        std::cout << "[Steam] Username: " << g_steamName << "\n";
+    }
+}
 
 LRESULT CALLBACK HookedWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -216,12 +238,13 @@ void ENet_Poll()
             {
                 unsigned id;
                 float x, y, z, yaw;
+                char name[64];
 
-                sscanf(msg.c_str(), "SYNC %u %f %f %f %f", &id, &x, &y, &z, &yaw);
-
+                sscanf(msg.c_str(), "SYNC %u %f %f %f %f %s", &id, &x, &y, &z, &yaw, name);
                 // ignore our own data
                 if (id != GetCurrentProcessId()) {
                     g_otherPlayers[id] = { x, y, z, yaw };
+                    g_otherPlayers[id].name = name;
                 }
             }
 
@@ -236,8 +259,6 @@ void ENet_Poll()
         }
     }
 }
-
-
 
 
 void CheckToggleKey()
@@ -401,6 +422,20 @@ void DrawSanta(LPDIRECT3DDEVICE9 dev, const D3DXVECTOR3& pos, float size, float 
     lastPos = pos;
 }
 
+void DrawTextSimple(IDirect3DDevice9* dev, float x, float y, D3DCOLOR color, const char* text)
+{
+    if (!g_pFont) return;
+
+    RECT rect;
+    rect.left = (LONG)x;
+    rect.top = (LONG)y;
+    rect.right = rect.left + 300;
+    rect.bottom = rect.top + 50;
+
+    g_pFont->DrawTextA(NULL, text, -1, &rect, DT_NOCLIP, color);
+}
+
+
 // =====================================================
 // Project world → screen using Camera
 // =====================================================
@@ -432,34 +467,46 @@ bool ProjectWorldToScreen(IDirect3DDevice9* dev, const D3DXVECTOR3& world, D3DXV
 // =====================================================
 static void TryResolveGamePointers()
 {
-    if (!g_gameBase) {
-        HMODULE mod = GetModuleHandleW(L"SantaClausInTrouble.exe");
-        if (mod) {
-            g_gameBase = reinterpret_cast<uintptr_t>(mod);
-            std::cout << "[Overlay] Base = 0x" << std::hex << g_gameBase << std::dec << "\n";
+    __try {
+        if (!g_gameBase) {
+            HMODULE mod = GetModuleHandleW(L"SantaClausInTrouble.exe");
+            if (mod) {
+                g_gameBase = reinterpret_cast<uintptr_t>(mod);
+                std::cout << "[Overlay] Base = 0x" << std::hex << g_gameBase << std::dec << "\n";
+            }
+        }
+
+        if (g_gameBase && !g_camPtr) {
+            uintptr_t root = *(uintptr_t*)(g_gameBase + OFF_CAM_ROOTPTR);
+            if (!root) return;
+            uintptr_t p = root;
+
+            for (auto o : CAMERA_CHAIN_OFFS) {
+                p = *(uintptr_t*)(p + o);
+                if (!p) return;
+            }
+            g_camPtr = p;
+            std::cout << "[Overlay] Cam = 0x" << std::hex << g_camPtr << std::dec << "\n";
+        }
+
+        if (g_gameBase && !g_santaBase) {
+            uintptr_t root = *(uintptr_t*)(g_gameBase + OFF_PLAYER_ROOT);
+            if (!root) return;
+            uintptr_t p = root;
+            for (auto o : PLAYER_CHAIN_OFFS) {
+                p = *(uintptr_t*)(p + o);
+                if (!p) return;
+            }
+            g_santaBase = p;
+            std::cout << "[Overlay] Santa = 0x" << std::hex << g_santaBase << std::dec << "\n";
         }
     }
-    if (g_gameBase && !g_camPtr) {
-        uintptr_t root = *(uintptr_t*)(g_gameBase + OFF_CAM_ROOTPTR);
-        if (!root) return;
-        uintptr_t p = root;
-        for (auto o : CAMERA_CHAIN_OFFS) {
-            p = *(uintptr_t*)(p + o);
-            if (!p) return;
-        }
-        g_camPtr = p;
-    }
-    if (g_gameBase && !g_santaBase) {
-        uintptr_t root = *(uintptr_t*)(g_gameBase + OFF_PLAYER_ROOT);
-        if (!root) return;
-        uintptr_t p = root;
-        for (auto o : PLAYER_CHAIN_OFFS) {
-            p = *(uintptr_t*)(p + o);
-            if (!p) return;
-        }
-        g_santaBase = p;
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // ignore crash, keep waiting
+        Sleep(50);
     }
 }
+
 
 
 
@@ -495,8 +542,14 @@ HRESULT __stdcall hkDrawIndexedPrimitive(
     if (NumVertices == 8426 && PrimCount == 14796) {
         D3DXVECTOR3 playerWorld = { px, py, pz };
         D3DXVECTOR3 playerScreen;
+        D3DXVECTOR3 namePos(px, py, pz + 1.5f);
+        D3DXVECTOR3 nameScreen;
         ProjectWorldToScreen(dev, playerWorld, playerScreen);
-
+        if (ProjectWorldToScreen(dev, namePos, nameScreen))
+        {
+            DrawTextSimple(dev, nameScreen.x, nameScreen.y,
+                D3DCOLOR_ARGB(255, 255, 255, 255), g_steamName.c_str());
+        }
         if (drawESP) {
             dev->SetVertexShader(nullptr);
             dev->SetPixelShader(nullptr);
@@ -545,6 +598,14 @@ HRESULT __stdcall hkDrawIndexedPrimitive(
                     const RemotePlayer& rp = kv.second;
 
                     D3DXVECTOR3 santaWorld(rp.x, rp.y, rp.z);
+                    D3DXVECTOR3 namePos(rp.x, rp.y, rp.z + 1.5f);
+                    D3DXVECTOR3 nameScreen;
+                    ProjectWorldToScreen(dev, playerWorld, playerScreen);
+                    if (ProjectWorldToScreen(dev, namePos, nameScreen))
+                    {
+                        DrawTextSimple(dev, nameScreen.x, nameScreen.y,
+                            D3DCOLOR_ARGB(255, 255, 255, 255), rp.name.c_str());
+                    }
 
                     DrawSanta(dev, santaWorld, 1.5f, -rp.yaw);
                 }
@@ -661,17 +722,40 @@ HRESULT __stdcall hkEndScene(IDirect3DDevice9* dev)
     if (!g_santaBase || !g_camPtr)
         return oEndScene(dev);
 
-    if (!gameWindow)
+    if (!g_pFont)
+    {
+        D3DXCreateFontA(
+            dev,                      // device
+            18,                       // height
+            0,                        // width
+            FW_BOLD,                  // weight
+            1,                        // miplevels
+            FALSE,                    // italic
+            DEFAULT_CHARSET,
+            OUT_DEFAULT_PRECIS,
+            ANTIALIASED_QUALITY,
+            DEFAULT_PITCH | FF_DONTCARE,
+            "Arial",
+            &g_pFont
+        );
+
+        std::cout << "[ESP] Font created\n";
+    }
+
+
+    /*if (!gameWindow)
     {
         D3DDEVICE_CREATION_PARAMETERS p;
         dev->GetCreationParameters(&p);
         gameWindow = p.hFocusWindow;
     }
     else if (!windowHooked){
-        HookWindow(gameWindow);
+        //HookWindow(gameWindow);
         std::cout << "Window hooked - pausing disabled.\n";
         windowHooked = true;
-    }
+    }*/
+
+
 
     IDirect3DSurface9* backBuf = nullptr;
     if (SUCCEEDED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuf)))
@@ -686,11 +770,12 @@ HRESULT __stdcall hkEndScene(IDirect3DDevice9* dev)
 
     if (g_isConnected) {
         char buf[128];
-        sprintf(buf, "POS %.3f %.3f %.3f %.3f %u", px, py, pz, pyaw, GetCurrentProcessId());
+        sprintf(buf, "POS %.3f %.3f %.3f %.3f %u %s", px, py, pz, pyaw, GetCurrentProcessId(), g_steamName.c_str());
         ENet_Send(buf);
     }
 
     g_gifts.clear();
+
 
     return oEndScene(dev);
 }
@@ -732,15 +817,16 @@ DWORD WINAPI MainThread(LPVOID)
     freopen("CONOUT$", "w", stdout);
     std::cout << "[Overlay] DLL loaded\n";
 
-    ENet_Connect("127.0.0.1", 12345);
+    while (!g_gameBase || !g_camPtr || !g_santaBase) {
+        TryResolveGamePointers();
+    }
 
     if (MH_Initialize() != MH_OK)
         return 0;
 
-
     int tries = 0;
     void** vtbl = nullptr;
-    while (!vtbl || tries < 60) {
+    while (!vtbl) {
         vtbl = GetDeviceVTable();
         tries++;
     }
@@ -751,16 +837,35 @@ DWORD WINAPI MainThread(LPVOID)
     if (MH_CreateHook(vtbl[42], &hkEndScene, (void**)&oEndScene) == MH_OK)
         MH_EnableHook(vtbl[42]);
 
-    MH_CreateHook(&ClipCursor, hkClipCursor, (void**)&oClipCursor);
+    /*MH_CreateHook(&ClipCursor, hkClipCursor, (void**)&oClipCursor);
     MH_EnableHook(&ClipCursor);
     MH_CreateHook(&SetCursorPos, hkSetCursorPos, (void**)&oSetCursorPos);
     MH_EnableHook(&SetCursorPos);
-    ShowCursor(true);
+    ShowCursor(true);*/
     std::cout << "[Overlay] Hooks active\n";
-    
-    while (!g_gameBase) {
-        TryResolveGamePointers();
+
+    // Wait for steam_api to load
+    while (!hSteam) {
+        hSteam = GetModuleHandleA("steam_api.dll");
+        Sleep(100);
     }
+    std::cout << "[Steam] Found steam_api module at " << hSteam << "\n";
+
+    if (hSteam) {
+        // Steam version detected
+        TryGrabSteamName();
+    }
+    if (!hSteam || "Noob" == g_steamName) {
+        char username[256];
+        DWORD size = 256;
+        if (GetUserNameA(username, &size)) {
+            g_steamName = username;
+        }
+        else {
+            g_steamName = "UnknownPlayer";
+        }
+    }
+    ENet_Connect("REDACTED", 27015);
 
     return 0;
 }
