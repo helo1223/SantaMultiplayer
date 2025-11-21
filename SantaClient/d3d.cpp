@@ -282,30 +282,29 @@ void OnDrawIndexedPrimitive(
                 savedStride = stride;
             }
         }
-        else {
-            if (savedVB && savedIB)
+
+        if (savedVB && savedIB)
+        {
+            DrawSanta(dev, testWorld, 1.5f, 0.0f);
+            oDrawIndexedPrimitive(dev, D3DPT_TRIANGLELIST, 0, 0, 8426, 0, 14796);
+
+            for (auto& kv : g_otherPlayers)
             {
-                DrawSanta(dev, testWorld, 1.5f, 0.0f);
+                const RemotePlayer& rp = kv.second;
+                Vec3 playerPos = rp.pos;
+                D3DXVECTOR3 santaWorld = Vec3ToVector3(playerPos);
+                D3DXVECTOR3 namePos = Vec3ToVector3(playerPos);
+                namePos.z += 1.5f;
+                D3DXVECTOR3 nameScreen;
+                if (ProjectWorldToScreen(dev, namePos, nameScreen))
+                {
+                    DrawTextSimple(dev, nameScreen.x, nameScreen.y,
+                        D3DCOLOR_ARGB(255, 255, 255, 255), rp.name.c_str());
+                }
+
+                DrawSanta(dev, santaWorld, 1.5f, -rp.yaw);
                 oDrawIndexedPrimitive(dev, D3DPT_TRIANGLELIST, 0, 0, 8426, 0, 14796);
 
-                for (auto& kv : g_otherPlayers)
-                {
-                    const RemotePlayer& rp = kv.second;
-                    Vec3 playerPos = rp.pos;
-                    D3DXVECTOR3 santaWorld = Vec3ToVector3(playerPos);
-                    D3DXVECTOR3 namePos = Vec3ToVector3(playerPos);
-                    namePos.z += 1.5f;
-                    D3DXVECTOR3 nameScreen;
-                    if (ProjectWorldToScreen(dev, namePos, nameScreen))
-                    {
-                        DrawTextSimple(dev, nameScreen.x, nameScreen.y,
-                            D3DCOLOR_ARGB(255, 255, 255, 255), rp.name.c_str());
-                    }
-
-                    DrawSanta(dev, santaWorld, 1.5f, -rp.yaw);
-                    oDrawIndexedPrimitive(dev, D3DPT_TRIANGLELIST, 0, 0, 8426, 0, 14796);
-
-                }
             }
         }
     }
