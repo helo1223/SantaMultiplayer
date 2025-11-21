@@ -10,6 +10,6 @@ namespace gifts {
 	extern bool drawESP;
 
 	void CheckToggleKey();
-	void DrawGiftESP(IDirect3DDevice9* dev, D3DXVECTOR3 localPlayerScreen);
+	void DrawGiftESP(IDirect3DDevice9* dev);
 
 }

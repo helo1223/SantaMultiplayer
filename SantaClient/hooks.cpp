@@ -64,7 +64,17 @@ HRESULT __stdcall hkDrawIndexedPrimitive(
 {
     HRESULT result = oDrawIndexedPrimitive(dev, Type, BaseVertexIndex, MinVertexIndex, NumVertices, StartIndex, PrimCount);
 
+    IDirect3DStateBlock9* stateBlock = nullptr;
+    dev->CreateStateBlock(D3DSBT_ALL, &stateBlock);
+    if (stateBlock) stateBlock->Capture();
+
     OnDrawIndexedPrimitive(dev, Type, BaseVertexIndex, MinVertexIndex, NumVertices, StartIndex, PrimCount);
+
+    if (stateBlock)
+    {
+        stateBlock->Apply();
+        stateBlock->Release();
+    }
 
     return result;
 }

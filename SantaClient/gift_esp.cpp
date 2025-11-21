@@ -1,5 +1,6 @@
 #include "gift_esp.h"
 #include "d3d.h"
+#include "players.h"
 namespace gifts {
 
     bool drawESP = false;
@@ -11,8 +12,12 @@ namespace gifts {
         }
     }
 
-    void DrawGiftESP(IDirect3DDevice9* dev, D3DXVECTOR3 localPlayerScreen)
+    void DrawGiftESP(IDirect3DDevice9* dev)
     {
+        D3DXVECTOR3 localPlayerWorld = Vec3ToVector3(g_localPlayerPos);
+        D3DXVECTOR3 localPlayerScreen;
+        ProjectWorldToScreen(dev, localPlayerWorld, localPlayerScreen);
+
         float vsConsts[4 * 4];
         dev->GetVertexShaderConstantF(0, vsConsts, 4);
         float* m = &vsConsts[0];

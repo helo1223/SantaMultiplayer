@@ -12,7 +12,15 @@ D3DXVECTOR3 testWorld = { 0.0f, 0.0f, 0.91f };
 
 IDirect3DVertexBuffer9* savedVB = nullptr;
 IDirect3DIndexBuffer9* savedIB = nullptr;
+IDirect3DTexture9* savedSantaTexture = nullptr;
+
 UINT savedStride = 0;
+
+LPD3DXMESH g_testMesh = nullptr;
+DWORD g_numMaterials = 0;
+std::vector<IDirect3DTexture9*> g_textures;
+std::vector<D3DMATERIAL9> g_materials;
+static bool modelLoaded = false;
 
 static const Vertex cubeVerts[] =
 {
@@ -39,6 +47,74 @@ static const WORD cubeIndices[] =
     // bottom
     4,5,1, 4,1,0
 };
+
+void LoadTestModel(IDirect3DDevice9* dev)
+{
+    LPD3DXBUFFER materialBuffer = nullptr;
+
+    if (FAILED(D3DXLoadMeshFromX(
+        L"tiny.x",
+        D3DXMESH_MANAGED,
+        dev,
+        NULL,
+        &materialBuffer,
+        NULL,
+        &g_numMaterials,
+        &g_testMesh)))
+    {
+        std::cout << "[MODEL] Failed to load tiny.x\n";
+        return;
+    }
+
+    std::cout << "[MODEL] Loaded tiny.x successfully (" << g_numMaterials << " materials)\n";
+
+    D3DXMATERIAL* mats = (D3DXMATERIAL*)materialBuffer->GetBufferPointer();
+    g_materials.resize(g_numMaterials);
+    g_textures.resize(g_numMaterials);
+
+    for (DWORD i = 0; i < g_numMaterials; i++)
+    {
+        g_materials[i] = mats[i].MatD3D;
+        g_materials[i].Ambient = g_materials[i].Diffuse;
+
+        if (mats[i].pTextureFilename)
+        {
+            if (FAILED(D3DXCreateTextureFromFileA(dev, mats[i].pTextureFilename, &g_textures[i])))
+            {
+                D3DXCreateTextureFromFileA(dev, "Tiny_skin.dds", &g_textures[i]);
+            }
+        }
+        else
+        {
+            D3DXCreateTextureFromFileA(dev, "Tiny_skin.dds", &g_textures[i]);
+        }
+    }
+
+    materialBuffer->Release();
+}
+
+
+// ================= LIGHTING ==================
+void SetupModelLights(IDirect3DDevice9* dev)
+{
+    dev->SetRenderState(D3DRS_LIGHTING, TRUE);
+    dev->SetRenderState(D3DRS_ZENABLE, TRUE);
+    dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+    dev->SetRenderState(D3DRS_NORMALIZENORMALS, TRUE);
+    dev->SetRenderState(D3DRS_SPECULARENABLE, FALSE);
+
+    dev->SetRenderState(D3DRS_AMBIENT, D3DCOLOR_XRGB(120, 120, 120));
+
+    // directional light
+    D3DLIGHT9 light{};
+    light.Type = D3DLIGHT_DIRECTIONAL;
+    light.Diffuse = D3DXCOLOR(1, 1, 1, 1);
+    light.Direction = D3DXVECTOR3(0.5f, -0.3f, 1.0f);
+
+    dev->SetLight(0, &light);
+    dev->LightEnable(0, TRUE);
+}
+
 
 D3DXVECTOR3 Vec3ToVector3(Vec3 vec3) {
     return D3DXVECTOR3{ vec3.x, vec3.y, vec3.z };
@@ -128,19 +204,9 @@ void DrawSanta(LPDIRECT3DDEVICE9 dev, const D3DXVECTOR3& pos, float size, float 
 {
     dev->SetVertexShader(nullptr);
     dev->SetPixelShader(nullptr);
+    SetupModelLights(dev);
     dev->SetRenderState(D3DRS_LIGHTING, FALSE);
-    dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
-    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
-    dev->SetRenderState(D3DRS_SPECULARENABLE, FALSE);
 
-    for (int i = 0; i < 8; ++i)
-    {
-        dev->SetTextureStageState(i, D3DTSS_COLOROP, D3DTOP_DISABLE);
-        dev->SetTextureStageState(i, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
-    }
-    dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
-    dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_ZERO);
-    dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
 
     D3DXMATRIX mScale, mTrans, mWorld, mRot, mRotX, mRotY, mRotZ;
     D3DXMatrixScaling(&mScale, size, size, size);
@@ -151,13 +217,16 @@ void DrawSanta(LPDIRECT3DDEVICE9 dev, const D3DXVECTOR3& pos, float size, float 
     mRot = mRotX * mRotY * mRotZ;
 
     mWorld = mScale * mRot * mTrans;
-    dev->SetFVF(D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_TEX1);
     dev->SetTransform(D3DTS_WORLD, &mWorld);
     dev->SetTransform(D3DTS_VIEW, &g_view);
     dev->SetTransform(D3DTS_PROJECTION, &g_proj);
     dev->SetStreamSource(0, savedVB, 0, savedStride);
     dev->SetIndices(savedIB);
 
+    if (savedSantaTexture)
+        dev->SetTexture(0, savedSantaTexture);
+
+    oDrawIndexedPrimitive(dev, D3DPT_TRIANGLELIST, 0, 0, 8426, 0, 14796);
 }
 
 void updateCameraPositions() 
@@ -213,54 +282,95 @@ bool ProjectWorldToScreen(IDirect3DDevice9* dev, const D3DXVECTOR3& world, D3DXV
     return true;
 }
 
+
+void DrawTestModel(IDirect3DDevice9* dev)
+{
+    if (!modelLoaded) {
+        LoadTestModel(dev);
+        modelLoaded = true;
+    }
+    if (!g_testMesh) return;
+
+    dev->SetVertexShader(nullptr);
+    dev->SetPixelShader(nullptr);
+    SetupModelLights(dev);
+
+
+    D3DXMATRIX scale, trans, world;
+    D3DXMatrixScaling(&scale, 0.006f, 0.006f, 0.006f);
+    D3DXMatrixTranslation(&trans, 1.f, 1.f, 1.5f); // adjust position
+    world = scale * trans;
+
+    dev->SetTransform(D3DTS_WORLD, &world);
+    dev->SetTransform(D3DTS_VIEW, &g_view);
+    dev->SetTransform(D3DTS_PROJECTION, &g_proj);
+
+    for (DWORD i = 0; i < g_numMaterials; i++)
+    {
+        dev->SetMaterial(&g_materials[i]);
+        dev->SetTexture(0, g_textures[i]);
+        g_testMesh->DrawSubset(i);
+    }
+}
+
+bool testDrawn = false;
+
 void OnDrawIndexedPrimitive(
     IDirect3DDevice9* dev, D3DPRIMITIVETYPE Type,
     INT BaseVertexIndex, UINT MinVertexIndex,
     UINT NumVertices, UINT StartIndex, UINT PrimCount)
 {
-    D3DXVECTOR3 localPlayerWorld = Vec3ToVector3(g_localPlayerPos);
-    D3DXVECTOR3 localPlayerScreen;
-    ProjectWorldToScreen(dev, localPlayerWorld, localPlayerScreen);
-
-    IDirect3DStateBlock9* stateBlock = nullptr;
-    dev->CreateStateBlock(D3DSBT_ALL, &stateBlock);
-    if (stateBlock) stateBlock->Capture();
-
+    IDirect3DSurface9* surf = nullptr;
+    dev->GetRenderTarget(0, &surf);
     if (NumVertices == 200 && PrimCount == 148)
     {
-        if(gifts::drawESP)
-            gifts::DrawGiftESP(dev, localPlayerScreen);
-    }
-
-    if (NumVertices == 8426 && PrimCount == 14796) {
-
-        D3DXVECTOR3 localNamePos = Vec3ToVector3(g_localPlayerPos);
-        localNamePos.z += 1.5f;
-        D3DXVECTOR3 nameScreen;
-        if (ProjectWorldToScreen(dev, localNamePos, nameScreen))
-        {
-            DrawTextSimple(dev, nameScreen.x, nameScreen.y,
-                D3DCOLOR_ARGB(255, 255, 255, 255), g_steamName.c_str());
-        }
-
-
-        if (!savedVB && !savedIB)
-        {
-            StoreSantaModel(dev);
-        }
-
-        if (savedVB && savedIB)
-        {
-            DrawSanta(dev, testWorld, 1.5f, 0.0f);
-            oDrawIndexedPrimitive(dev, D3DPT_TRIANGLELIST, 0, 0, 8426, 0, 14796);
-
-            DrawPlayers(dev);
+        if (gifts::drawESP) {
+            IDirect3DStateBlock9* stateBlock = nullptr;
+            dev->CreateStateBlock(D3DSBT_ALL, &stateBlock);
+            if (stateBlock) stateBlock->Capture();
+            gifts::DrawGiftESP(dev);
+            if (stateBlock)
+            {
+                stateBlock->Apply();
+                stateBlock->Release();
+            }
         }
     }
-    if (stateBlock)
+
+    if (surf)
     {
-        stateBlock->Apply();
-        stateBlock->Release();
+        D3DSURFACE_DESC desc;
+        surf->GetDesc(&desc);
+        surf->Release();
+
+        bool isBackBuffer = desc.Format == D3DFMT_A8R8G8B8;
+        if (isBackBuffer)
+        {
+            if (NumVertices == 8426 && PrimCount == 14796) {
+                D3DXVECTOR3 localNamePos = Vec3ToVector3(g_localPlayerPos);
+                localNamePos.z += 1.5f;
+                D3DXVECTOR3 nameScreen;
+                if (ProjectWorldToScreen(dev, localNamePos, nameScreen))
+                {
+                    DrawTextSimple(dev, nameScreen.x, nameScreen.y,
+                        D3DCOLOR_ARGB(255, 255, 255, 255), g_steamName.c_str());
+                }
+
+                if (!savedVB && !savedIB)
+                {
+                    StoreSantaModel(dev);
+                }
+                if (savedVB && savedIB)
+                {
+                    DrawSanta(dev, testWorld, 1.5f, 0.f);
+                    DrawPlayers(dev);
+                }            
+            }
+            if (!testDrawn) {
+                testDrawn = true;
+                DrawTestModel(dev);
+            }
+        }
     }
 }
 
@@ -273,12 +383,26 @@ void StoreSantaModel(IDirect3DDevice9* dev)
         IDirect3DIndexBuffer9* ib = nullptr;
         dev->GetIndices(&ib);
 
+        // --- Store texture bound at stage 0 ---
+        IDirect3DBaseTexture9* tex = nullptr;
+        dev->GetTexture(0, &tex);
+
         if (vb && ib)
         {
-            savedVB = vb;  savedVB->AddRef();
-            savedIB = ib;  savedIB->AddRef();
+            savedVB = vb; savedVB->AddRef();
+            savedIB = ib; savedIB->AddRef();
             savedStride = stride;
         }
+
+        if (tex)
+        {
+            savedSantaTexture = (IDirect3DTexture9*)tex;
+            savedSantaTexture->AddRef();
+            tex->Release();
+        }
+
+        if (vb) vb->Release();
+        if (ib) ib->Release();
 }
 
 void DrawPlayers(IDirect3DDevice9* dev)
@@ -298,7 +422,6 @@ void DrawPlayers(IDirect3DDevice9* dev)
         }
 
         DrawSanta(dev, santaWorld, 1.5f, -rp.yaw);
-        oDrawIndexedPrimitive(dev, D3DPT_TRIANGLELIST, 0, 0, 8426, 0, 14796);
     }
 }
 
@@ -310,5 +433,7 @@ void OnEndScene(IDirect3DDevice9* dev)
     gifts::CheckToggleKey();
     updatePlayerCoords();
     updateViewMatrix(dev);
+
+    testDrawn = false;
 
 }
