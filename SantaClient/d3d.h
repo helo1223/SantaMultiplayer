@@ -31,3 +31,6 @@ void OnDrawIndexedPrimitive(
 
 void OnEndScene(IDirect3DDevice9* dev);
 D3DXVECTOR3 Vec3ToVector3(Vec3 vec3);
+
+void StoreSantaModel(IDirect3DDevice9* dev);
+void DrawPlayers(IDirect3DDevice9* dev);

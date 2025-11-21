@@ -1,15 +1,15 @@
 #pragma once
 #include "global.h"
 #include <vector>
-
+#include <d3dx9.h>
 constexpr int TOGGLE_KEY = VK_F1;
 
 namespace gifts {
 
 	struct Gift { Vec3 pos; float yaw; };
-	extern std::vector<Gift> g_gifts;
 	extern bool drawESP;
 
 	void CheckToggleKey();
+	void DrawGiftESP(IDirect3DDevice9* dev, D3DXVECTOR3 localPlayerScreen);
 
 }

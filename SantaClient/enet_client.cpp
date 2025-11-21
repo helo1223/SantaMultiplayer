@@ -116,5 +116,4 @@ namespace net {
         enet_deinitialize();
         g_isConnected = false;
     }
-
 }

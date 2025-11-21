@@ -218,69 +218,34 @@ void OnDrawIndexedPrimitive(
     INT BaseVertexIndex, UINT MinVertexIndex,
     UINT NumVertices, UINT StartIndex, UINT PrimCount)
 {
+    D3DXVECTOR3 localPlayerWorld = Vec3ToVector3(g_localPlayerPos);
+    D3DXVECTOR3 localPlayerScreen;
+    ProjectWorldToScreen(dev, localPlayerWorld, localPlayerScreen);
+
     IDirect3DStateBlock9* stateBlock = nullptr;
     dev->CreateStateBlock(D3DSBT_ALL, &stateBlock);
     if (stateBlock) stateBlock->Capture();
 
     if (NumVertices == 200 && PrimCount == 148)
     {
-
-        float vsConsts[4 * 4];
-        dev->GetVertexShaderConstantF(0, vsConsts, 4);
-        float* m = &vsConsts[0];
-        float wx = m[3], wy = m[7], wz = m[11];
-        float yaw = atan2(m[2], m[0]);
-
-        gifts::g_gifts.push_back({ Vec3{wx, wy, wz}, yaw });
+        gifts::DrawGiftESP(dev, localPlayerScreen);
     }
 
     if (NumVertices == 8426 && PrimCount == 14796) {
-        D3DXVECTOR3 localPlayerWorld = Vec3ToVector3(g_localPlayerPos);
-        D3DXVECTOR3 localPlayerScreen;
+
         D3DXVECTOR3 localNamePos = Vec3ToVector3(g_localPlayerPos);
         localNamePos.z += 1.5f;
         D3DXVECTOR3 nameScreen;
-        ProjectWorldToScreen(dev, localPlayerWorld, localPlayerScreen);
         if (ProjectWorldToScreen(dev, localNamePos, nameScreen))
         {
             DrawTextSimple(dev, nameScreen.x, nameScreen.y,
                 D3DCOLOR_ARGB(255, 255, 255, 255), g_steamName.c_str());
         }
-        if (gifts::drawESP) {
-            dev->SetVertexShader(nullptr);
-            dev->SetPixelShader(nullptr);
-            dev->SetTexture(0, nullptr);
 
-            for (gifts::Gift g : gifts::g_gifts)
-            {
-                D3DXVECTOR3 world(g.pos.x, g.pos.z, g.pos.y);
-                D3DXVECTOR3 screen;
-
-                if (ProjectWorldToScreen(dev, world, screen))
-                {
-                    DrawCross(dev, screen.x, screen.y, 6.0f, D3DCOLOR_ARGB(255, 0, 255, 0));
-                    DrawLine(dev, localPlayerScreen.x, localPlayerScreen.y, screen.x, screen.y, D3DCOLOR_ARGB(180, 255, 255, 255));
-                    DrawCube(dev, world, 1.0f, g.yaw);
-
-                }
-            }
-        }
 
         if (!savedVB && !savedIB)
         {
-            IDirect3DVertexBuffer9* vb = nullptr;
-            UINT offset = 0, stride = 0;
-            dev->GetStreamSource(0, &vb, &offset, &stride);
-
-            IDirect3DIndexBuffer9* ib = nullptr;
-            dev->GetIndices(&ib);
-
-            if (vb && ib)
-            {
-                savedVB = vb;  savedVB->AddRef();
-                savedIB = ib;  savedIB->AddRef();
-                savedStride = stride;
-            }
+            StoreSantaModel(dev);
         }
 
         if (savedVB && savedIB)
@@ -288,30 +253,51 @@ void OnDrawIndexedPrimitive(
             DrawSanta(dev, testWorld, 1.5f, 0.0f);
             oDrawIndexedPrimitive(dev, D3DPT_TRIANGLELIST, 0, 0, 8426, 0, 14796);
 
-            for (auto& kv : g_otherPlayers)
-            {
-                const RemotePlayer& rp = kv.second;
-                Vec3 playerPos = rp.pos;
-                D3DXVECTOR3 santaWorld = Vec3ToVector3(playerPos);
-                D3DXVECTOR3 namePos = Vec3ToVector3(playerPos);
-                namePos.z += 1.5f;
-                D3DXVECTOR3 nameScreen;
-                if (ProjectWorldToScreen(dev, namePos, nameScreen))
-                {
-                    DrawTextSimple(dev, nameScreen.x, nameScreen.y,
-                        D3DCOLOR_ARGB(255, 255, 255, 255), rp.name.c_str());
-                }
-
-                DrawSanta(dev, santaWorld, 1.5f, -rp.yaw);
-                oDrawIndexedPrimitive(dev, D3DPT_TRIANGLELIST, 0, 0, 8426, 0, 14796);
-
-            }
+            DrawPlayers(dev);
         }
     }
     if (stateBlock)
     {
         stateBlock->Apply();
         stateBlock->Release();
+    }
+}
+
+void StoreSantaModel(IDirect3DDevice9* dev)
+{
+        IDirect3DVertexBuffer9* vb = nullptr;
+        UINT offset = 0, stride = 0;
+        dev->GetStreamSource(0, &vb, &offset, &stride);
+
+        IDirect3DIndexBuffer9* ib = nullptr;
+        dev->GetIndices(&ib);
+
+        if (vb && ib)
+        {
+            savedVB = vb;  savedVB->AddRef();
+            savedIB = ib;  savedIB->AddRef();
+            savedStride = stride;
+        }
+}
+
+void DrawPlayers(IDirect3DDevice9* dev)
+{
+    for (auto& kv : g_otherPlayers)
+    {
+        const RemotePlayer& rp = kv.second;
+        Vec3 playerPos = rp.pos;
+        D3DXVECTOR3 santaWorld = Vec3ToVector3(playerPos);
+        D3DXVECTOR3 namePos = Vec3ToVector3(playerPos);
+        namePos.z += 1.5f;
+        D3DXVECTOR3 nameScreen;
+        if (ProjectWorldToScreen(dev, namePos, nameScreen))
+        {
+            DrawTextSimple(dev, nameScreen.x, nameScreen.y,
+                D3DCOLOR_ARGB(255, 255, 255, 255), rp.name.c_str());
+        }
+
+        DrawSanta(dev, santaWorld, 1.5f, -rp.yaw);
+        oDrawIndexedPrimitive(dev, D3DPT_TRIANGLELIST, 0, 0, 8426, 0, 14796);
     }
 }
 
@@ -324,5 +310,4 @@ void OnEndScene(IDirect3DDevice9* dev)
     updatePlayerCoords();
     updateViewMatrix(dev);
 
-    gifts::g_gifts.clear();
 }
