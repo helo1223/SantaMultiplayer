@@ -824,11 +824,12 @@ DWORD WINAPI MainThread(LPVOID)
     if (MH_Initialize() != MH_OK)
         return 0;
 
-    int tries = 0;
     void** vtbl = nullptr;
-    while (!vtbl) {
+    while (true) {
         vtbl = GetDeviceVTable();
-        tries++;
+        if (vtbl && IsBadReadPtr(vtbl, sizeof(void*) * 120) == FALSE)  // or a safer page check
+            break;
+        Sleep(100);
     }
     if (!vtbl) return 0;
 
