@@ -14,7 +14,7 @@ DWORD WINAPI MainThread(LPVOID)
 
     GetPlayerName();
 
-    net::ENet_Connect("REDACTED", 27015);
+    net::ENet_Connect("127.0.0.1", 27015);
 
     return 0;
 }
