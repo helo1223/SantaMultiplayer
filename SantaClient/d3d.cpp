@@ -228,7 +228,8 @@ void OnDrawIndexedPrimitive(
 
     if (NumVertices == 200 && PrimCount == 148)
     {
-        gifts::DrawGiftESP(dev, localPlayerScreen);
+        if(gifts::drawESP)
+            gifts::DrawGiftESP(dev, localPlayerScreen);
     }
 
     if (NumVertices == 8426 && PrimCount == 14796) {
