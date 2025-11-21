@@ -3,7 +3,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.14.36623.8
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "test", "SantaCube.vcxproj", "{2F6C4D7D-45BC-4DAB-9F04-B7F7D63287E9}"
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "SantaClient", "SantaCube.vcxproj", "{2F6C4D7D-45BC-4DAB-9F04-B7F7D63287E9}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "SantaNet", "..\SantaNet\SantaNet.vcxproj", "{7B2EB158-EED1-4334-8273-7055AC231854}"
 EndProject
