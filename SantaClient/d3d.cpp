@@ -12,92 +12,278 @@ D3DXVECTOR3 testWorld = { 0.0f, 0.0f, 0.91f };
 
 IDirect3DVertexBuffer9* savedVB = nullptr;
 IDirect3DIndexBuffer9* savedIB = nullptr;
-IDirect3DTexture9* savedSantaTexture = nullptr;
 
 UINT savedStride = 0;
 
-LPD3DXMESH g_testMesh = nullptr;
-DWORD g_numMaterials = 0;
-std::vector<IDirect3DTexture9*> g_textures;
-std::vector<D3DMATERIAL9> g_materials;
-static bool modelLoaded = false;
+// ================= HIERARCHY TYPES ==================
 
-static const Vertex cubeVerts[] =
+struct D3DXFRAME_EX : public D3DXFRAME
 {
-    // Front face
-    {-0.5f,-0.5f,-0.5f, 0xFFFF0000}, {0.5f,-0.5f,-0.5f, 0xFFFF0000},
-    {0.5f, 0.5f,-0.5f, 0xFFFF0000}, {-0.5f, 0.5f,-0.5f, 0xFFFF0000},
-    // Back face
-    {-0.5f,-0.5f, 0.5f, 0xFF00FF00}, {0.5f,-0.5f, 0.5f, 0xFF00FF00},
-    {0.5f, 0.5f, 0.5f, 0xFF00FF00}, {-0.5f, 0.5f, 0.5f, 0xFF00FF00}
+    D3DXMATRIX CombinedMatrix;    // world-space combined
+    D3DXMATRIX OriginalMatrix;    // original local transform from .x
 };
 
-static const WORD cubeIndices[] =
+struct D3DXMESHCONTAINER_EX : public D3DXMESHCONTAINER
 {
-    // front
-    0,1,2, 0,2,3,
-    // back
-    5,4,7, 5,7,6,
-    // left
-    4,0,3, 4,3,7,
-    // right
-    1,5,6, 1,6,2,
-    // top
-    3,2,6, 3,6,7,
-    // bottom
-    4,5,1, 4,1,0
+    IDirect3DTexture9** ppTextures; // one per material
 };
 
-void LoadTestModel(IDirect3DDevice9* dev)
+LPD3DXFRAME g_rootFrame = nullptr;
+D3DXFRAME* g_flagFrame = nullptr;          // frame we’ll animate
+LPD3DXANIMATIONCONTROLLER g_animController = nullptr;
+
+class CAllocateHierarchy : public ID3DXAllocateHierarchy
 {
-    LPD3DXBUFFER materialBuffer = nullptr;
+public:
+    IDirect3DDevice9* m_device;
 
-    if (FAILED(D3DXLoadMeshFromX(
-        L"tiny.x",
-        D3DXMESH_MANAGED,
-        dev,
-        NULL,
-        &materialBuffer,
-        NULL,
-        &g_numMaterials,
-        &g_testMesh)))
+    CAllocateHierarchy() : m_device(nullptr) {}
+
+    void SetDevice(IDirect3DDevice9* dev) { m_device = dev; }
+
+    STDMETHOD(CreateFrame)(LPCSTR Name, LPD3DXFRAME* ppNewFrame)
     {
-        std::cout << "[MODEL] Failed to load tiny.x\n";
-        return;
-    }
+        if (!ppNewFrame) return E_INVALIDARG;
 
-    std::cout << "[MODEL] Loaded tiny.x successfully (" << g_numMaterials << " materials)\n";
+        D3DXFRAME_EX* pFrame = new D3DXFRAME_EX;
+        ZeroMemory(pFrame, sizeof(D3DXFRAME_EX));
 
-    D3DXMATERIAL* mats = (D3DXMATERIAL*)materialBuffer->GetBufferPointer();
-    g_materials.resize(g_numMaterials);
-    g_textures.resize(g_numMaterials);
-
-    for (DWORD i = 0; i < g_numMaterials; i++)
-    {
-        g_materials[i] = mats[i].MatD3D;
-        g_materials[i].Ambient = g_materials[i].Diffuse;
-
-        if (mats[i].pTextureFilename)
+        // Copy name
+        if (Name)
         {
-            if (FAILED(D3DXCreateTextureFromFileA(dev, mats[i].pTextureFilename, &g_textures[i])))
-            {
-                D3DXCreateTextureFromFileA(dev, "Tiny_skin.dds", &g_textures[i]);
-            }
+            size_t len = strlen(Name) + 1;
+            pFrame->Name = (LPSTR)malloc(len);
+            memcpy(pFrame->Name, Name, len);
         }
         else
         {
-            D3DXCreateTextureFromFileA(dev, "Tiny_skin.dds", &g_textures[i]);
+            pFrame->Name = nullptr;
+        }
+
+        D3DXMatrixIdentity(&pFrame->TransformationMatrix);
+        D3DXMatrixIdentity(&pFrame->CombinedMatrix);
+        D3DXMatrixIdentity(&pFrame->OriginalMatrix);
+
+        *ppNewFrame = pFrame;
+        return S_OK;
+    }
+
+    STDMETHOD(CreateMeshContainer)(
+        LPCSTR Name,
+        CONST D3DXMESHDATA* pMeshData,
+        CONST D3DXMATERIAL* pMaterials,
+        CONST D3DXEFFECTINSTANCE* pEffectInstances,
+        DWORD NumMaterials,
+        CONST DWORD* pAdjacency,
+        LPD3DXSKININFO pSkinInfo,
+        LPD3DXMESHCONTAINER* ppNewMeshContainer)
+    {
+        if (!ppNewMeshContainer) return E_INVALIDARG;
+        if (!pMeshData || pMeshData->Type != D3DXMESHTYPE_MESH)
+            return E_FAIL;
+
+        LPD3DXMESH pMesh = pMeshData->pMesh;
+        if (!pMesh) return E_FAIL;
+
+        D3DXMESHCONTAINER_EX* pContainer = new D3DXMESHCONTAINER_EX;
+        ZeroMemory(pContainer, sizeof(D3DXMESHCONTAINER_EX));
+
+        // Copy name
+        if (Name)
+        {
+            size_t len = strlen(Name) + 1;
+            pContainer->Name = (LPSTR)malloc(len);
+            memcpy(pContainer->Name, Name, len);
+        }
+        else
+        {
+            pContainer->Name = nullptr;
+        }
+
+        // Copy mesh
+        pContainer->MeshData.Type = D3DXMESHTYPE_MESH;
+        pContainer->MeshData.pMesh = pMesh;
+        pMesh->AddRef();
+
+        // Adjacency
+        if (pAdjacency)
+        {
+            pContainer->pAdjacency = (DWORD*)malloc(sizeof(DWORD) * pMesh->GetNumFaces() * 3);
+            memcpy(pContainer->pAdjacency, pAdjacency, sizeof(DWORD) * pMesh->GetNumFaces() * 3);
+        }
+
+        // Materials and textures
+        pContainer->NumMaterials = max(NumMaterials, (DWORD)1);
+        pContainer->pMaterials = (D3DXMATERIAL*)malloc(sizeof(D3DXMATERIAL) * pContainer->NumMaterials);
+        pContainer->ppTextures = (IDirect3DTexture9**)malloc(sizeof(IDirect3DTexture9*) * pContainer->NumMaterials);
+        ZeroMemory(pContainer->ppTextures, sizeof(IDirect3DTexture9*) * pContainer->NumMaterials);
+
+        for (DWORD i = 0; i < pContainer->NumMaterials; ++i)
+        {
+            if (pMaterials && i < NumMaterials)
+            {
+                pContainer->pMaterials[i] = pMaterials[i];
+
+                if (pMaterials[i].pTextureFilename && m_device)
+                {
+                    if (FAILED(D3DXCreateTextureFromFileA(m_device, pMaterials[i].pTextureFilename, &pContainer->ppTextures[i])))
+                    {
+                        D3DXCreateTextureFromFileA(m_device, "#tanne.dds", &pContainer->ppTextures[i]);
+                    }
+                }
+            }
+            else
+            {
+                ZeroMemory(&pContainer->pMaterials[i], sizeof(D3DXMATERIAL));
+                pContainer->pMaterials[i].MatD3D.Diffuse = D3DXCOLOR(1, 1, 1, 1);
+                pContainer->pMaterials[i].MatD3D.Ambient = D3DXCOLOR(1, 1, 1, 1);
+            }
+        }
+
+        pContainer->pSkinInfo = nullptr; // waypoint is static, no skinning
+
+        *ppNewMeshContainer = pContainer;
+        return S_OK;
+    }
+
+    STDMETHOD(DestroyFrame)(LPD3DXFRAME pFrameToFree)
+    {
+        if (!pFrameToFree) return S_OK;
+
+        D3DXFRAME_EX* pFrame = (D3DXFRAME_EX*)pFrameToFree;
+
+        if (pFrame->Name)
+            free(pFrame->Name);
+
+        delete pFrame;
+        return S_OK;
+    }
+
+    STDMETHOD(DestroyMeshContainer)(LPD3DXMESHCONTAINER pMeshContainerBase)
+    {
+        if (!pMeshContainerBase) return S_OK;
+
+        D3DXMESHCONTAINER_EX* pContainer = (D3DXMESHCONTAINER_EX*)pMeshContainerBase;
+
+        if (pContainer->Name)
+            free(pContainer->Name);
+
+        if (pContainer->MeshData.pMesh)
+            pContainer->MeshData.pMesh->Release();
+
+        if (pContainer->pAdjacency)
+            free(pContainer->pAdjacency);
+
+        if (pContainer->pMaterials)
+            free(pContainer->pMaterials);
+
+        if (pContainer->ppTextures)
+        {
+            for (DWORD i = 0; i < pContainer->NumMaterials; ++i)
+            {
+                if (pContainer->ppTextures[i])
+                    pContainer->ppTextures[i]->Release();
+            }
+            free(pContainer->ppTextures);
+        }
+
+        if (pContainer->pSkinInfo)
+            pContainer->pSkinInfo->Release();
+
+        delete pContainer;
+        return S_OK;
+    }
+};
+
+CAllocateHierarchy g_alloc;
+static bool g_waypointHierarchyLoaded = false;
+
+// ================= HIERARCHY UTILS ==================
+
+void InitFramesRecursive(D3DXFRAME* frame)
+{
+    if (!frame) return;
+
+    D3DXFRAME_EX* fex = (D3DXFRAME_EX*)frame;
+    fex->OriginalMatrix = fex->TransformationMatrix;
+
+    // Try to auto-detect a "flag" frame by name
+    if (frame->Name)
+    {
+        std::string name(frame->Name);
+
+        if (name == "Box02") // flag mesh
+        {
+            g_flagFrame = frame;
+            printf("Flag frame selected: %s\n", frame->Name);
         }
     }
 
-    materialBuffer->Release();
+    if (frame->pFrameSibling)
+        InitFramesRecursive(frame->pFrameSibling);
+    if (frame->pFrameFirstChild)
+        InitFramesRecursive(frame->pFrameFirstChild);
 }
 
+void UpdateCombinedMatrices(D3DXFRAME* frame, const D3DXMATRIX* parentMatrix)
+{
+    if (!frame) return;
+
+    D3DXFRAME_EX* fex = (D3DXFRAME_EX*)frame;
+
+    if (parentMatrix)
+        fex->CombinedMatrix = fex->TransformationMatrix * (*parentMatrix);
+    else
+        fex->CombinedMatrix = fex->TransformationMatrix;
+
+    if (frame->pFrameSibling)
+        UpdateCombinedMatrices(frame->pFrameSibling, parentMatrix);
+    if (frame->pFrameFirstChild)
+        UpdateCombinedMatrices(frame->pFrameFirstChild, &fex->CombinedMatrix);
+}
+
+void DrawMeshContainer(D3DXMESHCONTAINER_EX* pMeshCont, D3DXFRAME_EX* frame, IDirect3DDevice9* dev, const D3DXMATRIX& worldPlacement)
+{
+    if (!pMeshCont || !pMeshCont->MeshData.pMesh)
+        return;
+
+    D3DXMATRIX finalWorld = frame->CombinedMatrix * worldPlacement;
+    dev->SetTransform(D3DTS_WORLD, &finalWorld);
+    dev->SetTransform(D3DTS_VIEW, &g_view);
+    dev->SetTransform(D3DTS_PROJECTION, &g_proj);
+
+    for (DWORD i = 0; i < pMeshCont->NumMaterials; ++i)
+    {
+        dev->SetMaterial(&pMeshCont->pMaterials[i].MatD3D);
+        dev->SetTexture(0, pMeshCont->ppTextures[i]);
+        pMeshCont->MeshData.pMesh->DrawSubset(i);
+    }
+}
+
+void DrawFrame(D3DXFRAME* frame, IDirect3DDevice9* dev, const D3DXMATRIX& worldPlacement)
+{
+    if (!frame) return;
+
+    D3DXFRAME_EX* fex = (D3DXFRAME_EX*)frame;
+
+    D3DXMESHCONTAINER_EX* pMeshCont = (D3DXMESHCONTAINER_EX*)frame->pMeshContainer;
+    while (pMeshCont)
+    {
+        DrawMeshContainer(pMeshCont, fex, dev, worldPlacement);
+        pMeshCont = (D3DXMESHCONTAINER_EX*)pMeshCont->pNextMeshContainer;
+    }
+
+    if (frame->pFrameSibling)
+        DrawFrame(frame->pFrameSibling, dev, worldPlacement);
+    if (frame->pFrameFirstChild)
+        DrawFrame(frame->pFrameFirstChild, dev, worldPlacement);
+}
 
 // ================= LIGHTING ==================
+
 void SetupModelLights(IDirect3DDevice9* dev)
 {
-    dev->SetRenderState(D3DRS_LIGHTING, TRUE);
+    dev->SetRenderState(D3DRS_LIGHTING, FALSE);
     dev->SetRenderState(D3DRS_ZENABLE, TRUE);
     dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
     dev->SetRenderState(D3DRS_NORMALIZENORMALS, TRUE);
@@ -105,16 +291,16 @@ void SetupModelLights(IDirect3DDevice9* dev)
 
     dev->SetRenderState(D3DRS_AMBIENT, D3DCOLOR_XRGB(120, 120, 120));
 
-    // directional light
     D3DLIGHT9 light{};
     light.Type = D3DLIGHT_DIRECTIONAL;
     light.Diffuse = D3DXCOLOR(1, 1, 1, 1);
-    light.Direction = D3DXVECTOR3(0.5f, -0.3f, 1.0f);
+    light.Direction = D3DXVECTOR3(0.f, 10.5f, 0.f);
 
     dev->SetLight(0, &light);
     dev->LightEnable(0, TRUE);
 }
 
+// ================= SIMPLE 2D / UTILS ==================
 
 D3DXVECTOR3 Vec3ToVector3(Vec3 vec3) {
     return D3DXVECTOR3{ vec3.x, vec3.y, vec3.z };
@@ -122,10 +308,10 @@ D3DXVECTOR3 Vec3ToVector3(Vec3 vec3) {
 
 void DrawLine(IDirect3DDevice9* dev, float x1, float y1, float x2, float y2, D3DCOLOR color)
 {
-    struct Vertex { float x, y, z, rhw; DWORD c; };
-    Vertex v[2] = { {x1, y1, 0.0f, 1.0f, color}, {x2, y2, 0.0f, 1.0f, color} };
+    struct V { float x, y, z, rhw; DWORD c; };
+    V v[2] = { {x1, y1, 0.0f, 1.0f, color}, {x2, y2, 0.0f, 1.0f, color} };
     dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
-    dev->DrawPrimitiveUP(D3DPT_LINELIST, 1, v, sizeof(Vertex));
+    dev->DrawPrimitiveUP(D3DPT_LINELIST, 1, v, sizeof(V));
 }
 
 void DrawCross(IDirect3DDevice9* dev, float x, float y, float size, D3DCOLOR color)
@@ -179,12 +365,10 @@ void DrawTextSimple(IDirect3DDevice9* dev, float x, float y, D3DCOLOR color, con
             "Arial",
             &g_pFont
         );
-
     }
 
     if (!g_pFont) return;
 
-    // Measure text size
     RECT calcRect = { 0, 0, 0, 0 };
     g_pFont->DrawTextA(nullptr, text, -1, &calcRect, DT_CALCRECT, color);
 
@@ -200,6 +384,8 @@ void DrawTextSimple(IDirect3DDevice9* dev, float x, float y, D3DCOLOR color, con
     g_pFont->DrawTextA(nullptr, text, -1, &drawRect, DT_NOCLIP, color);
 }
 
+// ================= SANTA MODEL (unchanged) ==================
+
 void DrawSanta(LPDIRECT3DDEVICE9 dev, const D3DXVECTOR3& pos, float size, float yaw)
 {
     dev->SetVertexShader(nullptr);
@@ -207,9 +393,8 @@ void DrawSanta(LPDIRECT3DDEVICE9 dev, const D3DXVECTOR3& pos, float size, float 
     SetupModelLights(dev);
     dev->SetRenderState(D3DRS_LIGHTING, FALSE);
 
-
     D3DXMATRIX mScale, mTrans, mWorld, mRot, mRotX, mRotY, mRotZ;
-    D3DXMatrixScaling(&mScale, size, size, size);
+    D3DXMatrixScaling(&mScale, -size, size, size);
     D3DXMatrixTranslation(&mTrans, pos.x, pos.y, pos.z - 0.91f);
     D3DXMatrixRotationX(&mRotX, D3DXToRadian(90.f));
     D3DXMatrixRotationY(&mRotY, D3DXToRadian(0.f));
@@ -223,22 +408,24 @@ void DrawSanta(LPDIRECT3DDEVICE9 dev, const D3DXVECTOR3& pos, float size, float 
     dev->SetStreamSource(0, savedVB, 0, savedStride);
     dev->SetIndices(savedIB);
 
-    if (savedSantaTexture)
-        dev->SetTexture(0, savedSantaTexture);
-
     oDrawIndexedPrimitive(dev, D3DPT_TRIANGLELIST, 0, 0, 8426, 0, 14796);
 }
 
-void updateCameraPositions() 
+// ================= CAMERA / VIEW ==================
+
+void updateCameraPositions()
 {
-    g_camAt = { *(float*)(g_camPtr + offsets::CAMT_X),*(float*)(g_camPtr + offsets::CAMT_Y),*(float*)(g_camPtr + offsets::CAMT_Z) };
-    g_camPos = { *(float*)(g_camPtr + offsets::CAM_X),*(float*)(g_camPtr + offsets::CAM_Y),*(float*)(g_camPtr + offsets::CAM_Z) };
+    g_camAt = { *(float*)(g_camPtr + offsets::CAMT_X),
+                *(float*)(g_camPtr + offsets::CAMT_Y),
+                *(float*)(g_camPtr + offsets::CAMT_Z) };
+    g_camPos = { *(float*)(g_camPtr + offsets::CAM_X),
+                 *(float*)(g_camPtr + offsets::CAM_Y),
+                 *(float*)(g_camPtr + offsets::CAM_Z) };
 }
 
 void updateViewMatrix(IDirect3DDevice9* dev)
 {
     updateCameraPositions();
-
 
     D3DXVECTOR3 eye = Vec3ToVector3(g_camPos);
     D3DXVECTOR3 up(0, 0, 1);
@@ -254,7 +441,7 @@ void updateViewMatrix(IDirect3DDevice9* dev)
     float fovY = D3DXToRadian(50.0f);
     float aspect = (float)vp.Width / (float)vp.Height;
     float zn = 0.05f;
-    float zf = 120.0;
+    float zf = 120.0f;
 
     D3DXMatrixPerspectiveFovRH(&g_proj, fovY, aspect, zn, zf);
 }
@@ -282,36 +469,92 @@ bool ProjectWorldToScreen(IDirect3DDevice9* dev, const D3DXVECTOR3& world, D3DXV
     return true;
 }
 
+// ================= WAYPOINT MODEL DRAW (HIERARCHY) ==================
+
+void LoadWaypointModel(IDirect3DDevice9* dev)
+{
+    if (g_waypointHierarchyLoaded)
+        return;
+
+    g_alloc.SetDevice(dev);
+
+    if (FAILED(D3DXLoadMeshHierarchyFromX(
+        L"waypoint_000.x",
+        D3DXMESH_MANAGED,
+        dev,
+        &g_alloc,
+        nullptr,
+        &g_rootFrame,
+        &g_animController)))
+    {
+        std::cout << "[MODEL] Failed to load waypoint_000.x hierarchy\n";
+        return;
+    }
+
+    std::cout << "[MODEL] Loaded waypoint_000.x hierarchy\n";
+
+    InitFramesRecursive(g_rootFrame); // detect Box02 etc.
+
+    if (g_animController)
+    {
+        DWORD animSetCount = g_animController->GetNumAnimationSets();
+        if (animSetCount > 0)
+        {
+            LPD3DXANIMATIONSET animSet = nullptr;
+            g_animController->GetAnimationSet(0, &animSet);
+
+            g_animController->SetTrackAnimationSet(0, animSet);
+            g_animController->SetTrackEnable(0, TRUE);
+            g_animController->SetTrackWeight(0, 1.0f);
+            g_animController->SetTrackSpeed(0, 1.0f);  // normal speed
+        }
+    }
+
+    g_waypointHierarchyLoaded = true;
+}
+
+// Advances animation time continuously
+void UpdateAnimation()
+{
+    if (!g_animController) return;
+
+    static double lastTime = GetTickCount64() / 1000.0;
+    double current = GetTickCount64() / 1000.0;
+    double delta = current - lastTime;
+    lastTime = current;
+
+    g_animController->AdvanceTime(delta, nullptr);
+}
 
 void DrawTestModel(IDirect3DDevice9* dev)
 {
-    if (!modelLoaded) {
-        LoadTestModel(dev);
-        modelLoaded = true;
+    if (!g_waypointHierarchyLoaded)
+    {
+        LoadWaypointModel(dev);
     }
-    if (!g_testMesh) return;
+
+    UpdateAnimation();  // advance animation
 
     dev->SetVertexShader(nullptr);
     dev->SetPixelShader(nullptr);
     SetupModelLights(dev);
 
+    // Base transform (scale, rotate, translate into the world)
+    D3DXMATRIX scale, trans, rotX, worldPlacement;
+    D3DXMatrixScaling(&scale, 0.055f, 0.055f, 0.055f);
+    D3DXMatrixTranslation(&trans, 1.f, 2.f, 0.f);
+    D3DXMatrixRotationX(&rotX, D3DXToRadian(90.f));
 
-    D3DXMATRIX scale, trans, world;
-    D3DXMatrixScaling(&scale, 0.006f, 0.006f, 0.006f);
-    D3DXMatrixTranslation(&trans, 1.f, 1.f, 1.5f); // adjust position
-    world = scale * trans;
+    worldPlacement = scale * rotX * trans;
 
-    dev->SetTransform(D3DTS_WORLD, &world);
-    dev->SetTransform(D3DTS_VIEW, &g_view);
-    dev->SetTransform(D3DTS_PROJECTION, &g_proj);
+    // Update matrices recursively starting at root
+    UpdateCombinedMatrices(g_rootFrame, nullptr);
 
-    for (DWORD i = 0; i < g_numMaterials; i++)
-    {
-        dev->SetMaterial(&g_materials[i]);
-        dev->SetTexture(0, g_textures[i]);
-        g_testMesh->DrawSubset(i);
-    }
+    // Draw recursively
+    DrawFrame(g_rootFrame, dev, worldPlacement);
 }
+
+// ================= HOOKS / MAIN DRAW ==================
 
 bool testDrawn = false;
 
@@ -364,7 +607,7 @@ void OnDrawIndexedPrimitive(
                 {
                     DrawSanta(dev, testWorld, 1.5f, 0.f);
                     DrawPlayers(dev);
-                }            
+                }
             }
             if (!testDrawn) {
                 testDrawn = true;
@@ -376,33 +619,22 @@ void OnDrawIndexedPrimitive(
 
 void StoreSantaModel(IDirect3DDevice9* dev)
 {
-        IDirect3DVertexBuffer9* vb = nullptr;
-        UINT offset = 0, stride = 0;
-        dev->GetStreamSource(0, &vb, &offset, &stride);
+    IDirect3DVertexBuffer9* vb = nullptr;
+    UINT offset = 0, stride = 0;
+    dev->GetStreamSource(0, &vb, &offset, &stride);
 
-        IDirect3DIndexBuffer9* ib = nullptr;
-        dev->GetIndices(&ib);
+    IDirect3DIndexBuffer9* ib = nullptr;
+    dev->GetIndices(&ib);
 
-        // --- Store texture bound at stage 0 ---
-        IDirect3DBaseTexture9* tex = nullptr;
-        dev->GetTexture(0, &tex);
+    if (vb && ib)
+    {
+        savedVB = vb; savedVB->AddRef();
+        savedIB = ib; savedIB->AddRef();
+        savedStride = stride;
+    }
 
-        if (vb && ib)
-        {
-            savedVB = vb; savedVB->AddRef();
-            savedIB = ib; savedIB->AddRef();
-            savedStride = stride;
-        }
-
-        if (tex)
-        {
-            savedSantaTexture = (IDirect3DTexture9*)tex;
-            savedSantaTexture->AddRef();
-            tex->Release();
-        }
-
-        if (vb) vb->Release();
-        if (ib) ib->Release();
+    if (vb) vb->Release();
+    if (ib) ib->Release();
 }
 
 void DrawPlayers(IDirect3DDevice9* dev)
