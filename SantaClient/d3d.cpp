@@ -10,26 +10,23 @@ D3DXMATRIX g_proj;
 ID3DXFont* g_pFont = nullptr;
 D3DXVECTOR3 testWorld = { 0.0f, 0.0f, 0.91f };
 
-IDirect3DVertexBuffer9* savedVB = nullptr;
-IDirect3DIndexBuffer9* savedIB = nullptr;
-
-UINT savedStride = 0;
-
-// ================= HIERARCHY TYPES ==================
-
 struct D3DXFRAME_EX : public D3DXFRAME
 {
-    D3DXMATRIX CombinedMatrix;    // world-space combined
-    D3DXMATRIX OriginalMatrix;    // original local transform from .x
+    D3DXMATRIX CombinedMatrix;
+    D3DXMATRIX OriginalMatrix;
 };
 
 struct D3DXMESHCONTAINER_EX : public D3DXMESHCONTAINER
 {
-    IDirect3DTexture9** ppTextures; // one per material
+    IDirect3DTexture9** ppTextures = nullptr;
+    ID3DXMesh* pSkinMesh = nullptr;
+    D3DXMATRIX* BoneOffsets = nullptr;
+    D3DXMATRIX** FrameCombinedMatrixPtrs = nullptr;
+    D3DXEFFECTINSTANCE* pEffects = nullptr;
+    DWORD NumPaletteEntries = 0;
+    DWORD NumInfl = 0;
 };
-
 LPD3DXFRAME g_rootFrame = nullptr;
-D3DXFRAME* g_flagFrame = nullptr;          // frame we’ll animate
 LPD3DXANIMATIONCONTROLLER g_animController = nullptr;
 
 class CAllocateHierarchy : public ID3DXAllocateHierarchy
@@ -48,7 +45,6 @@ public:
         D3DXFRAME_EX* pFrame = new D3DXFRAME_EX;
         ZeroMemory(pFrame, sizeof(D3DXFRAME_EX));
 
-        // Copy name
         if (Name)
         {
             size_t len = strlen(Name) + 1;
@@ -88,47 +84,33 @@ public:
         D3DXMESHCONTAINER_EX* pContainer = new D3DXMESHCONTAINER_EX;
         ZeroMemory(pContainer, sizeof(D3DXMESHCONTAINER_EX));
 
-        // Copy name
         if (Name)
         {
             size_t len = strlen(Name) + 1;
             pContainer->Name = (LPSTR)malloc(len);
             memcpy(pContainer->Name, Name, len);
         }
-        else
-        {
-            pContainer->Name = nullptr;
-        }
+        else pContainer->Name = nullptr;
 
-        // Copy mesh
         pContainer->MeshData.Type = D3DXMESHTYPE_MESH;
         pContainer->MeshData.pMesh = pMesh;
         pMesh->AddRef();
 
-        // Adjacency
-        if (pAdjacency)
-        {
-            pContainer->pAdjacency = (DWORD*)malloc(sizeof(DWORD) * pMesh->GetNumFaces() * 3);
-            memcpy(pContainer->pAdjacency, pAdjacency, sizeof(DWORD) * pMesh->GetNumFaces() * 3);
-        }
-
-        // Materials and textures
         pContainer->NumMaterials = max(NumMaterials, (DWORD)1);
         pContainer->pMaterials = (D3DXMATERIAL*)malloc(sizeof(D3DXMATERIAL) * pContainer->NumMaterials);
         pContainer->ppTextures = (IDirect3DTexture9**)malloc(sizeof(IDirect3DTexture9*) * pContainer->NumMaterials);
         ZeroMemory(pContainer->ppTextures, sizeof(IDirect3DTexture9*) * pContainer->NumMaterials);
 
-        for (DWORD i = 0; i < pContainer->NumMaterials; ++i)
+        for (DWORD i = 0; i < pContainer->NumMaterials; i++)
         {
             if (pMaterials && i < NumMaterials)
             {
                 pContainer->pMaterials[i] = pMaterials[i];
-
                 if (pMaterials[i].pTextureFilename && m_device)
                 {
                     if (FAILED(D3DXCreateTextureFromFileA(m_device, pMaterials[i].pTextureFilename, &pContainer->ppTextures[i])))
                     {
-                        D3DXCreateTextureFromFileA(m_device, "#tanne.dds", &pContainer->ppTextures[i]);
+                        D3DXCreateTextureFromFileA(m_device, "nicolaus.dds", &pContainer->ppTextures[i]);
                     }
                 }
             }
@@ -140,11 +122,42 @@ public:
             }
         }
 
-        pContainer->pSkinInfo = nullptr; // waypoint is static, no skinning
+        if (pAdjacency)
+        {
+            DWORD numFaces = pMesh->GetNumFaces();
+            DWORD adjSize = numFaces * 3 * sizeof(DWORD);
+            pContainer->pAdjacency = (DWORD*)malloc(adjSize);
+            if (pContainer->pAdjacency)
+                memcpy(pContainer->pAdjacency, pAdjacency, adjSize);
+        }
+
+        pContainer->pSkinInfo = pSkinInfo;
+        if (pSkinInfo) pSkinInfo->AddRef();
+
+        if (pSkinInfo)
+        {
+            DWORD bones = pSkinInfo->GetNumBones();
+            pContainer->BoneOffsets = new D3DXMATRIX[bones];
+            pContainer->FrameCombinedMatrixPtrs = new D3DXMATRIX * [bones];
+
+            for (DWORD i = 0; i < bones; i++)
+            {
+                pContainer->BoneOffsets[i] = *pSkinInfo->GetBoneOffsetMatrix(i);
+                pContainer->FrameCombinedMatrixPtrs[i] = nullptr;
+            }
+
+            HRESULT hr = pMesh->CloneMeshFVF(
+                D3DXMESH_MANAGED,
+                pMesh->GetFVF(),
+                m_device,
+                &pContainer->pSkinMesh
+            );
+        }
 
         *ppNewMeshContainer = pContainer;
         return S_OK;
     }
+
 
     STDMETHOD(DestroyFrame)(LPD3DXFRAME pFrameToFree)
     {
@@ -196,9 +209,7 @@ public:
 };
 
 CAllocateHierarchy g_alloc;
-static bool g_waypointHierarchyLoaded = false;
-
-// ================= HIERARCHY UTILS ==================
+static bool g_santaModelLoaded = false;
 
 void InitFramesRecursive(D3DXFRAME* frame)
 {
@@ -207,56 +218,73 @@ void InitFramesRecursive(D3DXFRAME* frame)
     D3DXFRAME_EX* fex = (D3DXFRAME_EX*)frame;
     fex->OriginalMatrix = fex->TransformationMatrix;
 
-    // Try to auto-detect a "flag" frame by name
-    if (frame->Name)
-    {
-        std::string name(frame->Name);
-
-        if (name == "Box02") // flag mesh
-        {
-            g_flagFrame = frame;
-            printf("Flag frame selected: %s\n", frame->Name);
-        }
-    }
-
     if (frame->pFrameSibling)
         InitFramesRecursive(frame->pFrameSibling);
     if (frame->pFrameFirstChild)
         InitFramesRecursive(frame->pFrameFirstChild);
 }
 
-void UpdateCombinedMatrices(D3DXFRAME* frame, const D3DXMATRIX* parentMatrix)
+void DrawMeshContainer(D3DXMESHCONTAINER_EX* c, D3DXFRAME_EX* frame,
+    IDirect3DDevice9* dev, const D3DXMATRIX& worldPlacement)
 {
-    if (!frame) return;
-
-    D3DXFRAME_EX* fex = (D3DXFRAME_EX*)frame;
-
-    if (parentMatrix)
-        fex->CombinedMatrix = fex->TransformationMatrix * (*parentMatrix);
-    else
-        fex->CombinedMatrix = fex->TransformationMatrix;
-
-    if (frame->pFrameSibling)
-        UpdateCombinedMatrices(frame->pFrameSibling, parentMatrix);
-    if (frame->pFrameFirstChild)
-        UpdateCombinedMatrices(frame->pFrameFirstChild, &fex->CombinedMatrix);
-}
-
-void DrawMeshContainer(D3DXMESHCONTAINER_EX* pMeshCont, D3DXFRAME_EX* frame, IDirect3DDevice9* dev, const D3DXMATRIX& worldPlacement)
-{
-    if (!pMeshCont || !pMeshCont->MeshData.pMesh)
+    if (!c || !c->MeshData.pMesh)
         return;
 
-    D3DXMATRIX finalWorld = frame->CombinedMatrix * worldPlacement;
-    dev->SetTransform(D3DTS_WORLD, &finalWorld);
-    dev->SetTransform(D3DTS_VIEW, &g_view);
-    dev->SetTransform(D3DTS_PROJECTION, &g_proj);
-
-    for (DWORD i = 0; i < pMeshCont->NumMaterials; ++i)
+    // SOFTWARE SKINNING
+    if (c->pSkinInfo && c->pSkinMesh)
     {
-        dev->SetMaterial(&pMeshCont->pMaterials[i].MatD3D);
-        dev->SetTexture(0, pMeshCont->ppTextures[i]);
-        pMeshCont->MeshData.pMesh->DrawSubset(i);
+        DWORD bones = c->pSkinInfo->GetNumBones();
+        std::vector<D3DXMATRIX> boneMatrices(bones);
+
+        for (DWORD i = 0; i < bones; i++)
+        {
+            if (c->FrameCombinedMatrixPtrs[i])
+            {
+                boneMatrices[i] = c->BoneOffsets[i] * (*c->FrameCombinedMatrixPtrs[i]);
+            }
+            else
+            {
+                D3DXMatrixIdentity(&boneMatrices[i]);
+            }
+        }
+
+        BYTE* pSrc = nullptr;
+        BYTE* pDst = nullptr;
+
+        if (SUCCEEDED(c->MeshData.pMesh->LockVertexBuffer(D3DLOCK_READONLY, (void**)&pSrc)) &&
+            SUCCEEDED(c->pSkinMesh->LockVertexBuffer(0, (void**)&pDst)))
+        {
+            c->pSkinInfo->UpdateSkinnedMesh(&boneMatrices[0], NULL, pSrc, pDst);
+            c->MeshData.pMesh->UnlockVertexBuffer();
+            c->pSkinMesh->UnlockVertexBuffer();
+        }
+
+        dev->SetTransform(D3DTS_WORLD, &worldPlacement);
+        dev->SetTransform(D3DTS_VIEW, &g_view);
+        dev->SetTransform(D3DTS_PROJECTION, &g_proj);
+        dev->SetFVF(c->pSkinMesh->GetFVF());
+
+        for (DWORD i = 0; i < c->NumMaterials; i++)
+        {
+            dev->SetMaterial(&c->pMaterials[i].MatD3D);
+            dev->SetTexture(0, c->ppTextures[i]);
+            c->pSkinMesh->DrawSubset(i);
+        }
+    }
+    else
+    {
+        D3DXMATRIX world = frame->CombinedMatrix * worldPlacement;
+        dev->SetTransform(D3DTS_WORLD, &world);
+        dev->SetTransform(D3DTS_VIEW, &g_view);
+        dev->SetTransform(D3DTS_PROJECTION, &g_proj);
+        dev->SetFVF(c->MeshData.pMesh->GetFVF());
+
+        for (DWORD i = 0; i < c->NumMaterials; i++)
+        {
+            dev->SetMaterial(&c->pMaterials[i].MatD3D);
+            dev->SetTexture(0, c->ppTextures[i]);
+            c->MeshData.pMesh->DrawSubset(i);
+        }
     }
 }
 
@@ -279,11 +307,206 @@ void DrawFrame(D3DXFRAME* frame, IDirect3DDevice9* dev, const D3DXMATRIX& worldP
         DrawFrame(frame->pFrameFirstChild, dev, worldPlacement);
 }
 
-// ================= LIGHTING ==================
+void InitSkinningPointers(D3DXFRAME* frame)
+{
+    D3DXMESHCONTAINER_EX* c = (D3DXMESHCONTAINER_EX*)frame->pMeshContainer;
+
+    while (c)
+    {
+        if (c->pSkinInfo)
+        {
+            DWORD bones = c->pSkinInfo->GetNumBones();
+
+            for (DWORD i = 0; i < bones; i++)
+            {
+                const char* boneName = c->pSkinInfo->GetBoneName(i);
+                D3DXFRAME* boneFrame = D3DXFrameFind(g_rootFrame, boneName);
+                c->FrameCombinedMatrixPtrs[i] = &((D3DXFRAME_EX*)boneFrame)->CombinedMatrix;
+            }
+        }
+
+        c = (D3DXMESHCONTAINER_EX*)c->pNextMeshContainer;
+    }
+
+    if (frame->pFrameSibling) InitSkinningPointers(frame->pFrameSibling);
+    if (frame->pFrameFirstChild) InitSkinningPointers(frame->pFrameFirstChild);
+}
+
+void LoadExternalAnimationSets(const wchar_t* filename)
+{
+    if (!g_animController) return;
+
+    LPD3DXANIMATIONCONTROLLER tempController = nullptr;
+    LPD3DXFRAME tempRoot = nullptr;
+
+    HRESULT hr = D3DXLoadMeshHierarchyFromX(
+        filename,
+        D3DXMESH_MANAGED,
+        g_alloc.m_device,
+        &g_alloc,
+        nullptr,
+        &tempRoot,
+        &tempController);
+
+    if (FAILED(hr) || !tempController)
+    {
+        printf("Failed loading anim: 0x%X\n", hr);
+        return;
+    }
+
+    printf("Anim loaded OK\n");
+    DWORD animCount = tempController->GetNumAnimationSets();
+    printf("Animation sets: %u\n", animCount);
+
+    for (DWORD i = 0; i < animCount; i++)
+    {
+        LPD3DXANIMATIONSET animSet = nullptr;
+        tempController->GetAnimationSet(i, &animSet);
+
+        if (animSet)
+        {
+            printf("Register anim %u: %s (%.2fs)\n",
+                i,
+                animSet->GetName() ? animSet->GetName() : "Untitled",
+                animSet->GetPeriod());
+
+            g_animController->RegisterAnimationSet(animSet);
+            animSet->Release();
+        }
+    }
+
+    if (tempRoot)
+        D3DXFrameDestroy(tempRoot, &g_alloc);
+
+    tempController->Release();
+}
+
+void ApplyFirstAnimation()
+{
+    if (!g_animController) return;
+
+    LPD3DXANIMATIONSET animSet = nullptr;
+    g_animController->GetAnimationSet(0, &animSet);
+
+    if (animSet)
+    {
+        printf("Applying animation: %s, period %.2f\n",
+            animSet->GetName() ? animSet->GetName() : "Unnamed",
+            animSet->GetPeriod());
+
+        g_animController->SetTrackAnimationSet(0, animSet);
+        g_animController->SetTrackEnable(0, TRUE);
+        g_animController->SetTrackWeight(0, 1.0f);
+        g_animController->SetTrackSpeed(0, 1.0f);
+        g_animController->ResetTime();
+
+        animSet->Release();
+    }
+}
+
+
+void LoadWaypointModel(IDirect3DDevice9* dev)
+{
+    if (g_santaModelLoaded)
+        return;
+
+    g_alloc.SetDevice(dev);
+
+    if (FAILED(D3DXLoadMeshHierarchyFromX(
+        L"weihnachtsman_000.x",
+        D3DXMESH_MANAGED,
+        dev,
+        &g_alloc,
+        nullptr,
+        &g_rootFrame,
+        &g_animController)))
+    {
+        std::cout << "[MODEL] Failed to load weihnachtsman_000.x hierarchy\n";
+        return;
+    }
+
+    InitFramesRecursive(g_rootFrame);
+    InitSkinningPointers(g_rootFrame);
+
+    g_santaModelLoaded = true;
+}
+
+void D3DXFrameUpdateHierarchyMatrices(D3DXFRAME* frame, const D3DXMATRIX* parentMatrix)
+{
+    D3DXFRAME_EX* fex = (D3DXFRAME_EX*)frame;
+
+    if (parentMatrix)
+        fex->CombinedMatrix = fex->TransformationMatrix * (*parentMatrix);
+    else
+        fex->CombinedMatrix = fex->TransformationMatrix;
+
+    if (frame->pFrameSibling)
+        D3DXFrameUpdateHierarchyMatrices(frame->pFrameSibling, parentMatrix);
+    if (frame->pFrameFirstChild)
+        D3DXFrameUpdateHierarchyMatrices(frame->pFrameFirstChild, &fex->CombinedMatrix);
+}
+
+void UpdateFrameMatricesFromAnimation(D3DXFRAME* frame, LPD3DXANIMATIONSET animSet, double time)
+{
+    if (!frame) return;
+
+    D3DXFRAME_EX* fex = (D3DXFRAME_EX*)frame;
+
+    if (frame->Name)
+    {
+        D3DXVECTOR3 scale, trans;
+        D3DXQUATERNION rot;
+
+        UINT animIndex = 0;
+        if (SUCCEEDED(animSet->GetAnimationIndexByName(frame->Name, &animIndex)))
+        {
+            if (SUCCEEDED(animSet->GetSRT(time, animIndex, &scale, &rot, &trans)))
+            {
+                D3DXMATRIX matScale, matRot, matTrans;
+                D3DXMatrixScaling(&matScale, scale.x, scale.y, scale.z);
+                D3DXMatrixRotationQuaternion(&matRot, &rot);
+                D3DXMatrixTranslation(&matTrans, trans.x, trans.y, trans.z);
+
+                fex->TransformationMatrix = matScale * matRot * matTrans;
+            }
+        }
+    }
+
+    if (frame->pFrameSibling)
+        UpdateFrameMatricesFromAnimation(frame->pFrameSibling, animSet, time);
+    if (frame->pFrameFirstChild)
+        UpdateFrameMatricesFromAnimation(frame->pFrameFirstChild, animSet, time);
+}
+
+void UpdateAnimation()
+{
+    if (!g_animController || !g_rootFrame) return;
+
+    static double lastTime = GetTickCount64() / 1000.0;
+    double current = GetTickCount64() / 1000.0;
+    double delta = current - lastTime;
+    lastTime = current;
+
+    g_animController->AdvanceTime(delta, NULL);
+
+    D3DXTRACK_DESC trackDesc;
+    g_animController->GetTrackDesc(0, &trackDesc);
+
+    LPD3DXANIMATIONSET animSet = nullptr;
+    g_animController->GetTrackAnimationSet(0, &animSet);
+
+    if (animSet)
+    {
+        UpdateFrameMatricesFromAnimation(g_rootFrame, animSet, trackDesc.Position);
+        animSet->Release();
+    }
+
+    D3DXFrameUpdateHierarchyMatrices(g_rootFrame, nullptr);
+}
 
 void SetupModelLights(IDirect3DDevice9* dev)
 {
-    dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+    dev->SetRenderState(D3DRS_LIGHTING, TRUE);
     dev->SetRenderState(D3DRS_ZENABLE, TRUE);
     dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
     dev->SetRenderState(D3DRS_NORMALIZENORMALS, TRUE);
@@ -294,13 +517,11 @@ void SetupModelLights(IDirect3DDevice9* dev)
     D3DLIGHT9 light{};
     light.Type = D3DLIGHT_DIRECTIONAL;
     light.Diffuse = D3DXCOLOR(1, 1, 1, 1);
-    light.Direction = D3DXVECTOR3(0.f, 10.5f, 0.f);
+    light.Direction = D3DXVECTOR3(0.f, 0.f, -10.5f);
 
     dev->SetLight(0, &light);
     dev->LightEnable(0, TRUE);
 }
-
-// ================= SIMPLE 2D / UTILS ==================
 
 D3DXVECTOR3 Vec3ToVector3(Vec3 vec3) {
     return D3DXVECTOR3{ vec3.x, vec3.y, vec3.z };
@@ -347,6 +568,42 @@ void DrawCube(LPDIRECT3DDEVICE9 dev, const D3DXVECTOR3& pos, float size, float y
     );
 }
 
+void DrawBoneLines(D3DXFRAME* frame, IDirect3DDevice9* dev, const D3DXMATRIX& worldPlacement)
+{
+    if (!frame) return;
+
+    D3DXFRAME_EX* f = (D3DXFRAME_EX*)frame;
+
+    D3DXMATRIX finalMat = f->CombinedMatrix * worldPlacement;
+    D3DXVECTOR3 worldPos(finalMat._41, finalMat._42, finalMat._43);
+
+    D3DXVECTOR3 screenPos;
+    if (ProjectWorldToScreen(dev, worldPos, screenPos))
+        DrawCross(dev, screenPos.x, screenPos.y, 4, D3DCOLOR_ARGB(255, 255, 255, 0));
+
+    if (frame->pFrameFirstChild)
+    {
+        D3DXFRAME_EX* child = (D3DXFRAME_EX*)frame->pFrameFirstChild;
+        D3DXMATRIX childMat = child->CombinedMatrix * worldPlacement;
+        D3DXVECTOR3 childWorld(childMat._41, childMat._42, childMat._43);
+
+        D3DXVECTOR3 childScreen;
+        if (ProjectWorldToScreen(dev, childWorld, childScreen))
+        {
+            DrawLine(dev,
+                screenPos.x, screenPos.y,
+                childScreen.x, childScreen.y,
+                D3DCOLOR_ARGB(255, 0, 255, 0));
+        }
+    }
+
+    if (frame->pFrameSibling)
+        DrawBoneLines(frame->pFrameSibling, dev, worldPlacement);
+
+    if (frame->pFrameFirstChild)
+        DrawBoneLines(frame->pFrameFirstChild, dev, worldPlacement);
+}
+
 void DrawTextSimple(IDirect3DDevice9* dev, float x, float y, D3DCOLOR color, const char* text)
 {
     if (!g_pFont)
@@ -384,34 +641,33 @@ void DrawTextSimple(IDirect3DDevice9* dev, float x, float y, D3DCOLOR color, con
     g_pFont->DrawTextA(nullptr, text, -1, &drawRect, DT_NOCLIP, color);
 }
 
-// ================= SANTA MODEL (unchanged) ==================
-
 void DrawSanta(LPDIRECT3DDEVICE9 dev, const D3DXVECTOR3& pos, float size, float yaw)
 {
+    if (!g_santaModelLoaded) {
+        LoadWaypointModel(dev);
+    }
+
     dev->SetVertexShader(nullptr);
     dev->SetPixelShader(nullptr);
     SetupModelLights(dev);
-    dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+
+    UpdateAnimation();
 
     D3DXMATRIX mScale, mTrans, mWorld, mRot, mRotX, mRotY, mRotZ;
     D3DXMatrixScaling(&mScale, -size, size, size);
-    D3DXMatrixTranslation(&mTrans, pos.x, pos.y, pos.z - 0.91f);
+    D3DXMatrixTranslation(&mTrans, pos.x, pos.y, pos.z - 1.10f);
     D3DXMatrixRotationX(&mRotX, D3DXToRadian(90.f));
     D3DXMatrixRotationY(&mRotY, D3DXToRadian(0.f));
     D3DXMatrixRotationZ(&mRotZ, yaw);
     mRot = mRotX * mRotY * mRotZ;
 
     mWorld = mScale * mRot * mTrans;
-    dev->SetTransform(D3DTS_WORLD, &mWorld);
-    dev->SetTransform(D3DTS_VIEW, &g_view);
-    dev->SetTransform(D3DTS_PROJECTION, &g_proj);
-    dev->SetStreamSource(0, savedVB, 0, savedStride);
-    dev->SetIndices(savedIB);
 
-    oDrawIndexedPrimitive(dev, D3DPT_TRIANGLELIST, 0, 0, 8426, 0, 14796);
+    DrawFrame(g_rootFrame, dev, mWorld);
+    if (gifts::drawESP) {
+        DrawBoneLines(g_rootFrame, dev, mWorld);
+    }
 }
-
-// ================= CAMERA / VIEW ==================
 
 void updateCameraPositions()
 {
@@ -469,93 +725,6 @@ bool ProjectWorldToScreen(IDirect3DDevice9* dev, const D3DXVECTOR3& world, D3DXV
     return true;
 }
 
-// ================= WAYPOINT MODEL DRAW (HIERARCHY) ==================
-
-void LoadWaypointModel(IDirect3DDevice9* dev)
-{
-    if (g_waypointHierarchyLoaded)
-        return;
-
-    g_alloc.SetDevice(dev);
-
-    if (FAILED(D3DXLoadMeshHierarchyFromX(
-        L"waypoint_000.x",
-        D3DXMESH_MANAGED,
-        dev,
-        &g_alloc,
-        nullptr,
-        &g_rootFrame,
-        &g_animController)))
-    {
-        std::cout << "[MODEL] Failed to load waypoint_000.x hierarchy\n";
-        return;
-    }
-
-    std::cout << "[MODEL] Loaded waypoint_000.x hierarchy\n";
-
-    InitFramesRecursive(g_rootFrame); // detect Box02 etc.
-
-    if (g_animController)
-    {
-        DWORD animSetCount = g_animController->GetNumAnimationSets();
-        if (animSetCount > 0)
-        {
-            LPD3DXANIMATIONSET animSet = nullptr;
-            g_animController->GetAnimationSet(0, &animSet);
-
-            g_animController->SetTrackAnimationSet(0, animSet);
-            g_animController->SetTrackEnable(0, TRUE);
-            g_animController->SetTrackWeight(0, 1.0f);
-            g_animController->SetTrackSpeed(0, 1.0f);  // normal speed
-        }
-    }
-
-    g_waypointHierarchyLoaded = true;
-}
-
-// Advances animation time continuously
-void UpdateAnimation()
-{
-    if (!g_animController) return;
-
-    static double lastTime = GetTickCount64() / 1000.0;
-    double current = GetTickCount64() / 1000.0;
-    double delta = current - lastTime;
-    lastTime = current;
-
-    g_animController->AdvanceTime(delta, nullptr);
-}
-
-void DrawTestModel(IDirect3DDevice9* dev)
-{
-    if (!g_waypointHierarchyLoaded)
-    {
-        LoadWaypointModel(dev);
-    }
-
-    UpdateAnimation();  // advance animation
-
-    dev->SetVertexShader(nullptr);
-    dev->SetPixelShader(nullptr);
-    SetupModelLights(dev);
-
-    // Base transform (scale, rotate, translate into the world)
-    D3DXMATRIX scale, trans, rotX, worldPlacement;
-    D3DXMatrixScaling(&scale, 0.055f, 0.055f, 0.055f);
-    D3DXMatrixTranslation(&trans, 1.f, 2.f, 0.f);
-    D3DXMatrixRotationX(&rotX, D3DXToRadian(90.f));
-
-    worldPlacement = scale * rotX * trans;
-
-    // Update matrices recursively starting at root
-    UpdateCombinedMatrices(g_rootFrame, nullptr);
-
-    // Draw recursively
-    DrawFrame(g_rootFrame, dev, worldPlacement);
-}
-
-// ================= HOOKS / MAIN DRAW ==================
-
 bool testDrawn = false;
 
 void OnDrawIndexedPrimitive(
@@ -598,43 +767,14 @@ void OnDrawIndexedPrimitive(
                     DrawTextSimple(dev, nameScreen.x, nameScreen.y,
                         D3DCOLOR_ARGB(255, 255, 255, 255), g_steamName.c_str());
                 }
-
-                if (!savedVB && !savedIB)
-                {
-                    StoreSantaModel(dev);
-                }
-                if (savedVB && savedIB)
-                {
-                    DrawSanta(dev, testWorld, 1.5f, 0.f);
-                    DrawPlayers(dev);
-                }
+                DrawPlayers(dev);
             }
             if (!testDrawn) {
                 testDrawn = true;
-                DrawTestModel(dev);
+                DrawSanta(dev, testWorld, 0.015f, 0.f);
             }
         }
     }
-}
-
-void StoreSantaModel(IDirect3DDevice9* dev)
-{
-    IDirect3DVertexBuffer9* vb = nullptr;
-    UINT offset = 0, stride = 0;
-    dev->GetStreamSource(0, &vb, &offset, &stride);
-
-    IDirect3DIndexBuffer9* ib = nullptr;
-    dev->GetIndices(&ib);
-
-    if (vb && ib)
-    {
-        savedVB = vb; savedVB->AddRef();
-        savedIB = ib; savedIB->AddRef();
-        savedStride = stride;
-    }
-
-    if (vb) vb->Release();
-    if (ib) ib->Release();
 }
 
 void DrawPlayers(IDirect3DDevice9* dev)
@@ -653,7 +793,7 @@ void DrawPlayers(IDirect3DDevice9* dev)
                 D3DCOLOR_ARGB(255, 255, 255, 255), rp.name.c_str());
         }
 
-        DrawSanta(dev, santaWorld, 1.5f, -rp.yaw);
+        DrawSanta(dev, santaWorld, 0.015f, -rp.yaw);
     }
 }
 

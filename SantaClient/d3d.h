@@ -2,6 +2,7 @@
 #include "global.h"
 #include <d3d9.h>
 #include <d3dx9.h>
+#include <d3dx9anim.h>
 
 #define FVF_VERTEX (D3DFVF_XYZ | D3DFVF_DIFFUSE)
 
@@ -58,5 +59,4 @@ void OnDrawIndexedPrimitive(
 void OnEndScene(IDirect3DDevice9* dev);
 D3DXVECTOR3 Vec3ToVector3(Vec3 vec3);
 
-void StoreSantaModel(IDirect3DDevice9* dev);
 void DrawPlayers(IDirect3DDevice9* dev);
